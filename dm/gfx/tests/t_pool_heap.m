@@ -1,6 +1,6 @@
 // A CPU_NO_ACCESS pool's render targets share one placement heap (nvn_mtl.m pool_heap_texture): textures over the same storage share memory, storage apart stays apart,
 // a texture made over memory another has used leaves it as it is, and what is not a render target, or not in such a pool, keeps an allocation of its own.
-// "./t_pool_heap off" runs with DM_NVN_POOL_HEAP=0: no texture is placed.
+// "./t_pool_heap off" runs with DM_NVN_POOL_HEAP=0: no pool heap is made (a render target may still take a recycled heap of its own, rh_texture).
 #include "../nvn/nvn_mtl.m"
 void *front_metal_layer(void) { return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
@@ -56,7 +56,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     tex_t a = target(&pool, 995000, 0, 512, 512, NVN_TEXTURE_FLAGS_COMPRESSIBLE);
     id<MTLTexture> ma = tex_mtl(&a);
     if (off) {
-        CHECK(ma && !ma.heap, "DM_NVN_POOL_HEAP=0: a render target keeps an allocation of its own");
+        CHECK(ma && g_pool_heap_n == 0, "DM_NVN_POOL_HEAP=0: no pool heap is made (the target may take a recycled heap of its own, rh_texture)");
     } else {
         CHECK(ma.heap != nil, "a render target of a CPU_NO_ACCESS pool is placed in the pool's heap");
         CHECK(ma.heap.size <= (NSUInteger)(POOL * POOL_HEAP_SCALE) + (2 << 20), "the heap is about the pool's size, scaled");
