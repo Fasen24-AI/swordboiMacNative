@@ -579,8 +579,18 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), `0400486024DEC000`, [patches.py](../../dm/games/0400486024DEC000/patches.py).
 
 - **`game`**, frame rate, at goal, checked: v131072 main: one function with this fingerprint, the site and its free registers read by disassembly (2026-11-08): frame ratio from the host's step. The game's own frame-ratio division, found by its function's fingerprint on any build that keeps the function
+- **`build` → `game`**, rendering, blocked: the store and its role are verified for this main build only, checked: v131072 main E0F3CCFAF50065AE4EA01EB5AEB13B1A, original store and surrounding code, 2026-11-06: dynamic-resolution ceiling. The game's final scale store follows its dynamic and fixed-mode choices
+- **`build` → `game`**, rendering, blocked: the flag read and the scale constant are verified for this main build only, checked: v131072 main E0F3CCFAF50065AE4EA01EB5AEB13B1A, the tbz at +0x805bd0 and the fixed path at +0x80640c read by disassembly (2026-11-08): fixed resolution and its scale. The resolution controller's config flag and the fixed path's scale constant
 - **`game`**, rendering, at goal, checked: v131072 main: one function with each fingerprint (the level function a leaf, x2..x11 / x16 / x17 / s0..s2 free), its callers, the update and the controller fields read by disassembly, the fields read in play (2026-11-08); the climb run natively against a model of the update and in play to full size (2026-11-09): dynamic resolution: full size, or a climb on the load measured at each level. The game's own dynamic-resolution level function and update, found by their functions' fingerprints on any build that keeps both; switchable (DM_DYNAMIC_RESOLUTION)
 
+- **v131072 `main`** `e0f3ccfa…` ([patches.py:155](../../dm/games/0400486024DEC000/patches.py#L155))
+  - frame step `+0x6e6cc4`: frame ratio: the host's step × base rate / 60 instead of base rate / the game's frame rate (state page target fps; 0 = the game's ratio)
+  - frame step `+0x805bd0`: fixed resolution: the "dynamic resolution disabled" path also when state +0x60 is set
+  - frame step `+0x806420`: fixed resolution: its scale from state +0x64 (0 = the game's 1.0)
+  - frame step `+0x8065e0`: dynamic resolution level: 0 (full resolution), or with state +0x40 (DM_DYNAMIC_RESOLUTION) a climb on the load measured at each level
+  - frame step `+0x31d3f48`: dynamic resolution capped by the host render scale (1.0 = original)
+  - render scale stub (the launcher offers DM_RENDER_SCALE)
+  - launcher capabilities: DYNAMIC_RESOLUTION
 - **function-matched frame step** (`main` of builds without FRAME_STEP): frame ratio from the host's step: a function of 0x9b4 bytes, `+0xe4` in it; dynamic resolution, a function of 0x294 bytes, `+0x0` in it; dynamic resolution update, a function of 0xb24 bytes,  in it; launcher capabilities: DYNAMIC_RESOLUTION
 
 ### The Legend of Zelda: Tears of the Kingdom
