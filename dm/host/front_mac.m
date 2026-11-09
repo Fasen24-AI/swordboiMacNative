@@ -1493,7 +1493,7 @@ void front_run(void (*guest)(void)) {
             dispatch_async(dispatch_get_main_queue(), ^{ [g_cheats_menu showPanel:nil]; });
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
-        NSMenuItem *hud = [wm addItemWithTitle:@"Metal HUD" action:@selector(toggleMetalHUD:) keyEquivalent:@"h"];   // cmd-shift-H; the game view is not a responder, so the target is explicit
+        NSMenuItem *hud = [wm addItemWithTitle:@"Metal HUD" action:@selector(toggleMetalHUD:) keyEquivalent:@"H"];   // cmd-shift-H: an upper-case letter, as AppKit matches a shifted key equivalent (with "h" the item showed the shortcut and never fired); the game view is not a responder, so the target is explicit
         hud.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift; hud.target = v;
         NSApp.mainMenu = bar;
         const char *fs = getenv("DM_FULLSCREEN");   // 1 (or any value but 0): start in fullscreen; 0, the settings window's Window, or unset: a window

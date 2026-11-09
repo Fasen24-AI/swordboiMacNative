@@ -342,7 +342,7 @@ static _Atomic uint64_t g_rh_made, g_rh_reused, g_rh_trimmed;   // for the memor
 @end
 static char g_rh_owner_key;
 static int sw_mode(const char *name, int dflt); static inline int sw_on(int m);
-static int rh_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_RT_RECYCLE", 1); return m; }
+static int rh_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_RT_RECYCLE", 0); return m; }   // off by default here: with the pool heaps on (pool_heap_texture), Ocarina of Time on a 24 GB Mac went from 8.8 to 15.6 GB resident with it, the textures over the recycled heaps never retired (9/11, run/b20_norh.log)
 // A heap for a texture of this descriptor: the smallest waiting one it fits, up to an eighth larger, or a new one of its exact size. nil when the descriptor cannot be placed
 static id<MTLHeap> rh_take(MTLTextureDescriptor *d, int *reused) {
     MTLSizeAndAlign need = [g_dev heapTextureSizeAndAlignWithDescriptor:d];
