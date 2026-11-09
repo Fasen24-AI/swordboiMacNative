@@ -54,6 +54,17 @@ XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-textur
 # and its saturation gives 0, as Metal's precise:: functions (IEEE fmin / fmax) do on every GPU. The M4 Pro's fast ones happen to agree, an A20 Pro's do not: Super Mario Galaxy 2's
 # GX lighting takes max(0, NaN) from light directions left at zero, and the half of Mario its fill light faces came out white on the iPhone (GitHub issue 72; vk_shaders.py PRECISE)
 def precise(msl): return re.sub(r'\bfast::(min|max|clamp)\(', r'precise::\1(', msl)
+# A float add to storage memory with no result read (RED.F32, InstEmitMemory EmitAtomicAddF32) reaches the MSL as a compare-and-swap loop on the word: MSL 2.3 has no float atomics.
+# Metal has had atomic_float on device memory since MSL 3.0, and the compile takes the default language version. agl's scene analysis adds every thread's luminance into the same
+# few words this way, so its loops retried for each other: Ocarina of Time's 6e28359aa3558f61 (one workgroup of 256 threads, four words) took 0.25 ms a frame and 1bba09ec4bc8ff67
+# 0.40 ms on a MacBook Air M4, under 0.13 ms each as one atomic_fetch_add; the picture's exposure the same. Only the exact loop the translator writes is replaced
+FLOAT_ADD = re.compile(r'(?m)^( *)bool (_\d+);\n\1do\n\1\{\n\1    float (_\d+) = as_type<float>\((?P<addr>[^\n]*?)\);\n\1    float (_\d+) = \3 \+ (?P<val>[^;\n]+);\n'
+                       r'\1    uint (_\d+) = as_type<uint>\(\3\);\n\1    uint (_\d+);\n\1    do\n\1    \{\n\1        \8 = \7;\n'
+                       r'\1    \} while \(!atomic_compare_exchange_weak_explicit\(\(device atomic_uint\*\)&(?P<addr2>[^\n]*?), &\8, as_type<uint>\(\5\), memory_order_relaxed, memory_order_relaxed\) && \8 == \7\);\n'
+                       r'\1    uint (_\d+) = \8;\n\1    \2 = int\(\10\) != as_type<int>\(\3\);\n\1\} while \(\2\);\n')
+def float_add_msl(msl):
+    return FLOAT_ADD.sub(lambda m: m.group(0) if m.group('addr') != m.group('addr2') else
+                         f"{m.group(1)}atomic_fetch_add_explicit((device atomic_float*)&{m.group('addr')}, {m.group('val')}, memory_order_relaxed);\n", msl)
 
 # spirv-cross writes OpUMulExtended / OpSMulExtended as calls of an optnone template, spvMulExtended, as Metal's compiler may fail on an inlined mulhi (spirv_msl.cpp,
 # SPVFuncImplMulExtended). The barrier keeps every product a call that is never folded: Switch 2 shaders divide by constants through the high word of a product (Ocarina of Time
@@ -66,6 +77,42 @@ def mul_extended(msl):
     scalar = ''.join(f'template<typename T, typename U> static inline __attribute__((always_inline)) T spvMulExtended({t} l, {t} r) {{ {w} p = {w}(l) * {w}(r); return T{{U(p), U(p >> 32)}}; }}\n'
                      for t, w in (('uint', 'ulong'), ('int', 'long')))
     return msl[:found[0].end()] + scalar + msl[found[0].end():]
+# Loop guard: every loop in a shader also ends once the function has run LOOP_CAP iterations in all, so a loop that never ends on the host (a wrong translation,
+# an uninitialized bound, a value the replay does not fill) cannot hang the GPU. On macOS a command buffer that never completes is not always reclaimed when the
+# process exits: PRAGMATA's first frames left one and the whole Mac stopped (WindowServer watchdog) minutes later, twice. One counter per function, so nested loops
+# cannot multiply past the cap; 2^18 iterations per invocation is far beyond what a frame's shader does (PRAGMATA's longest bounded loop: 255)
+# A loop whose body holds a barrier (threadgroup_barrier / simdgroup_barrier, at any depth) counts on a counter of its own instead (dm_lg1, dm_lg2, ..., declared with dm_lg at the
+# top of its function and never reset, so it still bounds every pass through that loop in all). The shared counter is per thread: the barrier-free loops in and before such a loop
+# run per-thread trip counts (a thread-strided copy loop over N items gives the threads up to one iteration more or less each), so once the cap was reached, threads of one
+# threadgroup left a barrier loop at different iterations and the others waited at its barrier for ever, which Metal does not recover from. A barrier loop's own trip count is the
+# same for every thread of the group (the shader's barriers would be wrong on the Switch otherwise), so its own counter ends it on the same iteration for all of them.
+# PRAGMATA's cloth solver 6f364b25e417234a: an outer do { ... } while (--iterations != 0) with a barrier in it and in the batch loop inside it, with stride-1024 / stride-256 copy
+# and constraint loops before and inside: if the iteration count it reads is 0 (data the host did not fill), the loop wraps and only the guard ends it, and the first
+# gameplay frame's compute submission never completed
+LOOP_CAP = 1 << 18
+_LOOP_HEAD = re.compile(r'(\s*)(?:do|for \(.*\)|while \(.*\))\s*')
+_BARRIER = re.compile(r'\b(?:threadgroup|simdgroup)_barrier\s*\(')
+def loop_guard(msl):
+    lines, out = msl.split('\n'), []
+    fn_head = lambda i: lines[i] == '{' and i and lines[i - 1].rstrip().endswith(')')   # a function body (SPIRV-Cross puts its brace alone in column 0; a struct's header does not end in ')')
+    own, fn_own, fn = {}, {}, None   # own: the line rewritten (a do loop's closing line, else its header) -> its counter; fn_own: a function's brace line -> its loops' counters
+    for i, l in enumerate(lines):
+        if fn_head(i): fn = i; continue
+        if fn is None or not (m := _LOOP_HEAD.fullmatch(l)): continue
+        ind = len(m.group(1))
+        end = next((j for j in range(i + 1, len(lines)) if lines[j][ind:ind + 1] == '}' and not lines[j][:ind].strip()), None)   # SPIRV-Cross indents each block by 4: the body closes at the header's column
+        if end is None or not any(_BARRIER.search(x) for x in lines[i + 1:end]): continue
+        name = f'dm_lg{len(own) + 1}'; own[end if l.strip() == 'do' else i] = name; fn_own.setdefault(fn, []).append(name)
+    for i, l in enumerate(lines):
+        if fn_head(i):
+            out += [l] + [f'    uint {n} = 0u;\n    (void){n};' for n in ('dm_lg', *fn_own.get(i, ()))]; continue   # a statement a line: dmsh_meshstage.py _KERNEL reads a kernel's leading declarations that way
+        cap = f'++{own.get(i, "dm_lg")} < {LOOP_CAP}u'
+        if (m := re.fullmatch(r'(\s*)\} while \((.*)\);\s*', l)): l = f'{m.group(1)}}} while (({m.group(2)}) && {cap});'
+        elif (m := re.fullmatch(r'(\s*)for \(;;\)\s*', l)): l = f'{m.group(1)}for (; {cap};)'
+        elif (m := re.fullmatch(r'(\s*)while \((.*)\)\s*', l)): l = f'{m.group(1)}while (({m.group(2)}) && {cap})'
+        elif (m := re.fullmatch(r'(\s*)for \(([^;]*);([^;]*);([^;]*)\)\s*', l)): l = f'{m.group(1)}for ({m.group(2)}; ({m.group(3).strip() or "true"}) && {cap};{m.group(4)})'
+        out.append(l)
+    return '\n'.join(out)
 
 # Ampere HMMA.16816 with an f16 accumulator (agl's upscaler networks, the NDVE video networks) reaches the MSL as calls of dmsh_hmma16816_f16(lane, block, A0..A3, B0, B1, C0, C1,
 # flags, A's LDSM address, A0..A3's offsets, A's row stride, out D1) → D0, the subgroup's 256-word block of the scratch shared memory as the last argument (InstEmitAmpereTensor.AHmma,
@@ -412,10 +459,16 @@ static inline __attribute__((always_inline)) float4 dm_bmix(float4 r, float4 w, 
 static inline __attribute__((always_inline)) float dm_bmix(float r, float w, float4 k) {{ return r + (w - r) * k.x; }}
 template<typename V, typename T, typename... A> static inline __attribute__((always_inline)) V dm_bs(V r, constant dm_border_t* b, uint i, T t, sampler w, A... a)
 {{
-    if (b->mask >> i & 1u) r = dm_bmix(r, t.sample(w, a...), b->k[i]);
+    if (DM_BORDER_LIVE && (b->mask >> i & 1u)) r = dm_bmix(r, t.sample(w, a...), b->k[i]);
     return r;
 }}
 '''
+# The corrections also depend on the function constant abi.BORDER_FC: the host sets it (true: off) for a pipeline whose draw or dispatch binds no sampler with a twin, the usual case,
+# and the twin samples are compiled out with the registers they kept live (a uniform branch still costs them: Ocarina of Time's 1080p material passes spilled 300-400 bytes a thread,
+# 1.5 ms of a 26.7 ms frame on a MacBook Air M4, and its kernels, NDSR's network among them, 0.25 ms more). A pipeline the host does not specialize leaves it undefined: every sample
+# corrects as before. A kernel's pipeline is looked up by its specialized descriptor (nvn_mtl.m cps_new), and pso_offline.py builds it into the app's archive
+BORDER_LIVE_FC = (f'constant bool dm_border_off [[function_constant({abi.BORDER_FC})]];\n'
+                  'constant bool dm_border_live = !is_function_constant_defined(dm_border_off) || !dm_border_off;\n#define DM_BORDER_LIVE dm_border_live\n')
 def border_emu(msl):
     """The samples of the argument buffer's textures through its sampler members, T.sample(S, args) → dm_bs(T.sample(S, args), block, bit, T, S_w, args) (see BORDER_HELPERS);
     the source unchanged when it samples through none. Only samples of float textures: an integer texture is not filtered, and its border colour is Maxwell's integer one, which
@@ -443,7 +496,7 @@ def border_emu(msl):
         args = msl[m.end():i - 1]
         twin = f'spvDescriptorSet0.{m.group(2)}{abi.BORDER_TWIN}'
         msl = msl[:m.start()] + f'dm_bs({msl[m.start():i]}, spvDescriptorSet0.{abi.BORDER_MEMBER}, {bit[m.group(2)]}u, spvDescriptorSet0.{m.group(1)}, {twin}, {args})' + msl[i:]
-    return msl.replace('using namespace metal;\n', 'using namespace metal;\n' + BORDER_HELPERS, 1)
+    return msl.replace('using namespace metal;\n', 'using namespace metal;\n' + BORDER_LIVE_FC + BORDER_HELPERS, 1)
 # gl_FragCoord.z against a depth the shader read. NVIDIA stores a fragment's depth as the z its pixel shader reads, so a shader can test a fragment against a depth image of its own surface and
 # find them equal. Apple's GPU stores a value below the [[position]].z its fragment shader reads at some pixels: by up to one ulp of z plus a fraction of the depth's step across a pixel
 # (dm/gfx/tests/t_zsnap.m: 0.2% of a perspective triangle's pixels, 2% of flat ones, none above, the largest gap one ulp plus 2^-23 of fwidth(z)); writing [[position]].z as the depth would
@@ -1671,7 +1724,7 @@ def geometry_finish(key, w, j, c1):
         dmsh_geometry.flatten_sets(spv)
         r = subprocess.run([SPIRV_CROSS, *dmsh_atomic.cross_args(XC, spv), spv], capture_output=True, text=True)
         if r.returncode: return 'geometry MSL failed', r.stderr.strip()[:160], None
-        plain = dmsh_geometry.topology_pointer(pool_arrays(precise(dmsh_atomic.check_msl(r.stdout))))
+        plain = dmsh_geometry.topology_pointer(pool_arrays(loop_guard(precise(dmsh_atomic.check_msl(r.stdout)))))
         src = dmsh_geometry.capture_input(plain)
         res = json.load(open(os.path.join(w, k + '.res.json')))
         refl = {'key': key + '_bg' + str(t), 'route': 'B', 'chain': CHAIN, 'dm_ctl': key,
@@ -1701,7 +1754,7 @@ def geometry_finish(key, w, j, c1):
             spv = os.path.join(w, k + '.reader.spv'); dmsh_geometry.flatten_sets(spv)
             r = subprocess.run([SPIRV_CROSS, *dmsh_atomic.cross_args(XC, spv), spv], capture_output=True, text=True)
             if r.returncode: return 'geometry reader failed', r.stderr.strip()[:160], None
-            reader = vs_layer(vs_init(dmsh_geometry.reader(pool_arrays(precise(dmsh_atomic.check_msl(r.stdout))))))
+            reader = vs_layer(vs_init(dmsh_geometry.reader(pool_arrays(loop_guard(precise(dmsh_atomic.check_msl(r.stdout)))))))
             analysis, full = vs_depth(reader)
             meta = {'key': key + '_bgv', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key,
                     'stage': 'vs', 'entry': 'main0', 'entry_z': 'main0_z', 'msl_entry_kind': 'vertex',
@@ -1744,8 +1797,10 @@ def finish(key, w, j, c1):
     except ValueError as e: return 'image atomic MSL failed', str(e), None
     src = precise(src)   # min / max / clamp with Maxwell's NaN results (see precise)
     src = mul_extended(src)   # scalar extended products without the optnone wrapper (see mul_extended)
+    src = float_add_msl(src)   # a float add's compare-and-swap loop as one native atomic add (see float_add_msl)
     try: src = gather_offsets(src)   # four gathers instead of a wrapper's loop over their offsets (see gather_offsets)
     except ValueError as e: return 'gather offsets rewrite failed', str(e)[:160], None
+    src = loop_guard(src)   # no loop can run forever (see loop_guard)
     try: src = hmma_msl(src)   # Ampere HMMA through simdgroup_matrix (see hmma_msl)
     except ValueError as e: return 'HMMA rewrite failed', str(e)[:160], None
     try: src = hfma_msl(src)   # HFMA2 rounded once to half (see hfma_msl)

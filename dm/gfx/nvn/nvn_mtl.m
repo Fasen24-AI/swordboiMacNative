@@ -2514,7 +2514,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_dra
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[161];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
+static int g_red_once[162];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
 #define RED_ONCE(k, ...) do { _Static_assert((k) < sizeof g_red_once / sizeof *g_red_once, "a RED_ONCE key past g_red_once: raise its size"); if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -4227,11 +4227,26 @@ void mtl_tex_gpu_written(const tex_t *t) {
     }
     pthread_mutex_unlock(&g_gws_mu);
 }
+// A span whose overlap with [lo, hi) holds no whole page of it, and which does not cover it, is a sliver of something beside it, and does not decide: textures are 512-byte aligned,
+// so a GPU-drawn one may end in the page a CPU-filled one begins in; a span outlives the texture it was recorded for, so the game may hand part of that storage to a new texture; and
+// a GPU write over part of a span leaves the parts outside, which can be smaller than a page (gws_set). gws_cpu_since cannot answer for a sliver (no whole page to ask the dirty
+// tracker about), and taking its silence as the GPU's made the texture behind it a GPU texture: Ocarina of Time's CPU-filled 260x260 height (R32F) and hole (RGBA8) maps came up as
+// zeros when the span of a 260x260 RG8 normal map (laid out at 214,528 bytes) reached 1,536 or 13,824 bytes into them, or a 2,560-byte remnant of an old span lay inside them, and
+// whole terrain tiles vanished or showed another tile's surface (GitHub issue #1566). A span that covers the whole texture keeps the GPU's: a texture smaller than a page inside storage
+// the GPU wrote, whose neighbours' CPU writes in the same page do not count for it either
+static int gws_sliver(const gws_span *s, uintptr_t lo, uintptr_t hi) {
+    if (s->lo <= lo && s->hi >= hi) {
+        return 0;
+    }
+    uintptr_t a, e;
+    whole_pages(MAX(lo, s->lo), MIN(hi, s->hi), &a, &e);
+    return e <= a;
+}
 static int gws_owned(uintptr_t lo, uintptr_t hi) {   // the GPU wrote some of [lo, hi) and the CPU has not rewritten it since: the storage is not the content
     int owned = 0;
     pthread_mutex_lock(&g_gws_mu);
     for (size_t i = gws_find(lo); i < g_ngws && g_gws[i].lo < hi && !owned; i++) {
-        owned = !gws_cpu_since(&g_gws[i], lo, hi);
+        owned = !gws_sliver(&g_gws[i], lo, hi) && !gws_cpu_since(&g_gws[i], lo, hi);
     }
     pthread_mutex_unlock(&g_gws_mu);
     return owned;
@@ -4444,8 +4459,13 @@ static uint64_t g_texinfo_ser[8]; static int g_texinfo_n;
 // Single-description storage keeps the ordinary allocation. Families share an exact-sized placement heap, found through the existing alias table rather than a pool-lifetime owner.
 // Different formats, offsets, CPU-visible, sparse, linear, display, layered and multisample images keep their existing path. Inherited texels are not translated between incompatible
 // layouts: a changed layout is initialized by its GPU writer. Creating its descriptor must not zero another alias's live content in the earlier upload batch.
-static id<MTLTexture> image_texture(const tex_t *t, MTLTextureDescriptor *d) {
+static id<MTLTexture> image_texture(const tex_t *t, MTLTextureDescriptor *d0) {
     if (!image_shape(t) || !t->pool->mem || !(t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) || nvn_sparse_pool(t->pool)) return nil;
+    // Family members are written uncompressed (DM_NVN_FAMILY_NOCOMPRESS, on unless =0). With lossless compression a member read after another resolution wrote the shared bytes
+    // decodes the other's compressed blocks as garbage: ASTRAL CHAIN's 1600x900 HDR targets (loaded, never cleared) came back from the 1440x810 pause menu with 1.1M non-finite
+    // pixels, which bloom spread into a strobing pink / white glow. Uncompressed, the inherited bytes are only misplaced texels of the same format, as on the console
+    static int nocomp = -1; if (nocomp < 0) { const char *e = getenv("DM_NVN_FAMILY_NOCOMPRESS"); nocomp = !(e && !strcmp(e, "0")); }
+    MTLTextureDescriptor *d = d0; if (nocomp) { d = [d0 copy]; d.allowGPUOptimizedContents = NO; }
     MTLSizeAndAlign need = [g_dev heapTextureSizeAndAlignWithDescriptor:d];
     if (!need.size) return nil;
     NvImageHeap *owner = nil; MTLTextureDescriptor *largest = d; NSUInteger capacity = need.size; int family = 0;
@@ -4469,6 +4489,7 @@ static id<MTLTexture> image_texture(const tex_t *t, MTLTextureDescriptor *d) {
         family |= other->d.width != t->d.width || other->d.height != t->d.height;
         MTLTextureDescriptor *od = tex_desc(other, 0); if (!od) continue;
         od.pixelFormat = d.pixelFormat; od.usage |= d.usage;
+        if (nocomp) od.allowGPUOptimizedContents = NO;
         MTLSizeAndAlign sz = [g_dev heapTextureSizeAndAlignWithDescriptor:od];
         if (sz.size > capacity) { capacity = sz.size; largest = od; }
     }
@@ -6117,6 +6138,56 @@ static id<MTLFunction> fn_dev(id<MTLFunction> f) {
         return dev->fn;
     }
 }
+// A second specialization of a function object already in use, on the Metal 4 path. Metal hands out one MTLFunction per function content, device-wide: newFunctionWithName: on the same
+// library, or on another library loaded from the same data, returns the same object (macOS 27.2, M4). The host keys a specialization by its function object (fn4_note, fn_dev, pbase_key),
+// so noting other constants on that object would change the pipelines of every draw that uses it. This proxy is a distinct object for the new constants: fn4_note gives it its descriptor
+// and fn_dev its MTLDevice specialization, and every other message (name, reflection) goes to the base function. Metal never builds from it: Metal 4 pipelines take the descriptor, and
+// every MTLDevice pipeline takes its functions through fn_dev, as an unspecialized function with constants needs anyway
+@interface FnVariant : NSProxy { @public id<MTLFunction> base; } @end
+@implementation FnVariant
+- (id)forwardingTargetForSelector:(SEL)s { return base; }
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)s { return [(NSObject *)base methodSignatureForSelector:s]; }
+- (void)forwardInvocation:(NSInvocation *)i { [i invokeWithTarget:base]; }
+@end
+// Keep every prior specialization (alpha test, logic operation, merged outputs) and turn off only the border corrections. Cached by the descriptor f's constants were noted with
+// (fn4_of), not by f: Metal's shared function objects can be noted again. Compilation holds the entry's monitor, never the map lock. A failed specialization keeps the original, correct function.
+static os_unfair_lock g_bd_lock = OS_UNFAIR_LOCK_INIT;
+static NSMapTable *g_bd_fn;   // MTL4FunctionDescriptor → FnDev (fn: the function without the corrections)
+static id<MTLFunction> bd_off(id<MTLFunction> f) {
+    MTL4FunctionDescriptor *fd = fn4_of(f);
+    if (!fd) return f;   // no library to specialize from (diagnostic overrides)
+    os_unfair_lock_lock(&g_bd_lock);
+    if (!g_bd_fn) g_bd_fn = [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory capacity:0];
+    FnDev *entry = [g_bd_fn objectForKey:fd];
+    if (!entry) { entry = [FnDev new]; [g_bd_fn setObject:entry forKey:fd]; }
+    os_unfair_lock_unlock(&g_bd_lock);
+    @synchronized(entry) {
+        if (entry->fn) return entry->fn;
+        MTLFunctionConstantValues *cv = nil;
+        if ([fd isKindOfClass:MTL4SpecializedFunctionDescriptor.class]) {
+            MTL4SpecializedFunctionDescriptor *sd = (MTL4SpecializedFunctionDescriptor *)fd;
+            cv = [sd.constantValues copy]; fd = sd.functionDescriptor;
+        }
+        if (![fd isKindOfClass:MTL4LibraryFunctionDescriptor.class]) return entry->fn = f;
+        MTL4LibraryFunctionDescriptor *ld = (MTL4LibraryFunctionDescriptor *)fd;
+        if (![ld.library newFunctionWithName:ld.name].functionConstantsDictionary[@"dm_border_off"]) return entry->fn = f;   // the entry's, not f's: a specialized f lists no constants
+        if (!cv) cv = [MTLFunctionConstantValues new];
+        BOOL yes = YES; [cv setConstantValue:&yes type:MTLDataTypeBool atIndex:DMSH_BORDER_FC];
+        if (!pso4_compiler()) {   // MTLDevice pipelines: the specialized function, a distinct object
+            NSError *e = nil; entry->fn = fn_lib_spec(ld.library, ld.name, cv, &e);
+            if (!entry->fn) { MLOG("[RED] function %s: disabling unused border corrections failed: %s", f.name.UTF8String, e.localizedDescription.UTF8String); entry->fn = f; }
+            return entry->fn;
+        }
+        FnVariant *v = [FnVariant alloc]; v->base = f;
+        id<MTLFunction> vf = (id<MTLFunction>)v;
+        fn4_note(vf, ld.library, ld.name, cv);
+        os_unfair_lock_lock(&g_fn_dev_lock);
+        if (!g_fn_dev) g_fn_dev = [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory capacity:0];
+        [g_fn_dev setObject:[FnDev new] forKey:vf];
+        os_unfair_lock_unlock(&g_fn_dev_lock);
+        return entry->fn = vf;
+    }
+}
 static id<MTLComputePipelineState> cps_new(id<MTLFunction> f, NSError **e);   // a compute shader's pipeline: from the archive bundled with the app, else built
 // layer: a vertex shader's layer entry points (entry_layer / entry_layer_z, which also write the layer) instead of main0 / main0_z, for a program whose geometry shader is a slice writer (prog_fold_gs)
 static NvShader *shader_load(NSString *pc, int stage, int layer) {
@@ -6196,13 +6267,13 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
     if (stage == 1 && j[@"entry_m"]) { o->fn_m = fn4_note([lib newFunctionWithName:j[@"entry_m"]], lib, j[@"entry_m"], nil); o->mask_m = (uint8_t)[j[@"uint_mask_m"] unsignedIntValue];
         if (!o->fn_m) MLOG("[RED] shader %s: no mixed integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_m"] UTF8String]); }
     if (stage == 1 && j[@"entry_d"]) { o->fn_d = fn4_note([lib newFunctionWithName:j[@"entry_d"]], lib, j[@"entry_d"], nil); if (!o->fn_d) MLOG("[RED] shader %s: no dual-source entry point %s in its library", pc.UTF8String, [j[@"entry_d"] UTF8String]); }
-    if (o->fn.functionConstantsDictionary.count) {   // a compute shader with constants has MTLDevice pipelines (cps_new): it is specialized through its library (fn_spec otherwise)
-        NSError *fe = nil; MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new]; id<MTLFunction> (*spec)(id<MTLLibrary>, NSString *, MTLFunctionConstantValues *, NSError **) = stage == 5 ? fn_lib_spec : fn_spec;
-        id<MTLFunction> f = spec(lib, entry, cv, &fe);
+    if (o->fn.functionConstantsDictionary.count) {   // a compute shader's pipeline is looked up by this specialized descriptor too (cps_new); the MTLDevice builds it from fn_dev's
+        NSError *fe = nil; MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+        id<MTLFunction> f = fn_spec(lib, entry, cv, &fe);
         if (f) o->fn = f; else MLOG("[RED] shader %s: specializing its function constants failed: %s", pc.UTF8String, fe.localizedDescription.UTF8String);
-        if (o->fn_u) o->fn_u = spec(lib, j[@"entry_u"], cv, &fe);
-        if (o->fn_m) o->fn_m = spec(lib, j[@"entry_m"], cv, &fe);
-        if (o->fn_d) o->fn_d = spec(lib, j[@"entry_d"], cv, &fe);
+        if (o->fn_u) o->fn_u = fn_spec(lib, j[@"entry_u"], cv, &fe);
+        if (o->fn_m) o->fn_m = fn_spec(lib, j[@"entry_m"], cv, &fe);
+        if (o->fn_d) o->fn_d = fn_spec(lib, j[@"entry_d"], cv, &fe);
     }
     if (o->rf.nb) {
         o->ae = [o->fn newArgumentEncoderWithBufferIndex:o->rf.abi];
@@ -6405,6 +6476,8 @@ static int *g_treg_transient; static size_t g_ntreg_transient, g_treg_transient_
 static _Atomic uint64_t g_tser[1 << 20];
 static samp_par *g_sreg; static uint8_t *g_sreg_ok; static void **g_sview; static uint64_t *g_srid; static int g_nsreg;   // g_sview: sampler ID → MTLSamplerState (retained)
 static void **g_sview_w; static uint64_t *g_srid_w; static float (*g_sbk)[4];   // a sampler's twin for a border colour Metal lacks (retained, NULL = none) and the shader's factors k (see nvn_border.h)
+static _Atomic int g_border_any;   // a sampler needing corrections has been registered (sticky). Set before its lazy Metal creation, so its very first draw keeps the corrections
+static int border_need(NvShader *sh, int nvn_stage);
 // Memory pool Finalize: for texture IDs whose registered texture lives on this pool, drop the cached MTLTexture (view or base texture). The cache used to be released only when the ID was registered again,
 // so a linear texture built directly on a pool kept the whole pool buffer alive (6 to 17 finalized 16 MB pool buffers stayed alive in Engage's title demo). If the ID is still used, the next lookup rebuilds it on the slow path
 static void treg_drop_im(treg_t *r) { if (r->im) { defer_obj_unref((__bridge id)r->im); CFRelease(r->im); r->im = r->im_of = NULL; r->im_rid = 0; } }   // the image class view (img_fit)
@@ -6736,6 +6809,8 @@ void mtl_reg_samp(int sid, const samp_par *sp) {
     if (g_sview[id_]) { CFRelease(g_sview[id_]); g_sview[id_] = NULL; g_srid[id_] = 0; }
     if (g_sview_w[id_]) { CFRelease(g_sview_w[id_]); g_sview_w[id_] = NULL; g_srid_w[id_] = 0; }
     g_sreg[id_] = *sp; g_sreg_ok[id_] = 1;
+    int bn, bw; float k[4]; const uint8_t wrap[3] = {sp->ws, sp->wt, sp->wr};
+    if (nvn_border(sp->border, wrap, sp->reduction, &bn, &bw, k)) atomic_store(&g_border_any, 1);
     reg_bump(id_, 1);
     os_unfair_lock_unlock(&g_rmu);
 }
@@ -8239,6 +8314,7 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
     }
     #undef ZERO_ATTR
     d.vertexDescriptor = vd;
+    if (!k->border) { d.vertexFunction = bd_off(d.vertexFunction); d.fragmentFunction = bd_off(d.fragmentFunction); }
     return d;
 }
 // ---- Metal 4 pipelines: a base per pipeline with its colour state unspecialized, a per-game archive of the bases ----
@@ -8761,8 +8837,9 @@ static int pso4_compiler(void) { pso4_init(); return g_comp4 != nil; }   // rend
 // MTLDevice as before, and compiled again through the Metal 4 compiler into the current flush period on a background queue (arch_harvest), so the next start takes it from the
 // file that period writes: the MTLDevice's build is the one the system's shader cache serves, the capture compiles it whole (Star Fox's first 5 at its title: 1.2 ms in all
 // through the MTLDevice, 95 ms through the capture), so the dispatch never waits for the capture. Before, such a pipeline was built again at every start, and in full at each
-// one after the system's shader cache dropped it. Not looked up and not captured: a function with constants (fn_lib_spec specializes it through its library) and the embedded
-// kernels, which have no note. A miss costs a lookup of a fraction of a millisecond per file. g_cps_arch, g_cps_run, g_cps_built: compute pipelines taken from the
+// one after the system's shader cache dropped it. A function with constants is looked up and captured by its specialized descriptor (fn_spec; bd_off's, without the border corrections,
+// which pso_offline.py builds into the bundle), and built through the MTLDevice from the specialization fn_dev makes. Not looked up and not captured: the embedded kernels, which have no
+// note. A miss costs a lookup of a fraction of a millisecond per file. g_cps_arch, g_cps_run, g_cps_built: compute pipelines taken from the
 // bundle, from this device's files, built (the prewarm's last lines); g_cps_look_ns, g_cps_build_ns: the time looking up, building
 static _Atomic uint64_t g_cps_arch, g_cps_run, g_cps_built, g_cps_look_ns, g_cps_build_ns;
 static void arch_note_new(void);
@@ -8789,10 +8866,19 @@ static void arch_harvest(MTL4PipelineDescriptor *d, int compact) {
         }
     } });
 }
+// A function the border corrections' constant specializes: its compute pipeline is in the bundle and the archive by that descriptor. Any other function with constants is built
+// from fn_dev's specialization and is not looked up or captured
+static int fd_border_fc(MTL4FunctionDescriptor *fd) {
+    if (![fd isKindOfClass:MTL4SpecializedFunctionDescriptor.class]) return 0;
+    MTL4FunctionDescriptor *ld = ((MTL4SpecializedFunctionDescriptor *)fd).functionDescriptor;
+    if (![ld isKindOfClass:MTL4LibraryFunctionDescriptor.class]) return 0;
+    MTL4LibraryFunctionDescriptor *l = (MTL4LibraryFunctionDescriptor *)ld;
+    return [l.library newFunctionWithName:l.name].functionConstantsDictionary[@"dm_border_off"] != nil;
+}
 static id<MTLComputePipelineState> cps_new(id<MTLFunction> f, NSError **e) {
     pso4_init();
     MTL4FunctionDescriptor *fd = fn4_of(f); MTL4ComputePipelineDescriptor *d = nil; id<MTLComputePipelineState> ps = nil; uint64_t t0 = bp_now();
-    if ([fd isKindOfClass:MTL4LibraryFunctionDescriptor.class]) {
+    if ([fd isKindOfClass:MTL4LibraryFunctionDescriptor.class] || fd_border_fc(fd)) {   // a specialized one: fn_spec's or bd_off's, of a function with the border constant
         d = [MTL4ComputePipelineDescriptor new]; d.computeFunctionDescriptor = fd;
         if (g_arch_bundle && (ps = [g_arch_bundle newComputePipelineStateWithDescriptor:d error:nil])) atomic_fetch_add(&g_cps_arch, 1);
         else { int from_run = 0; if ((ps = arch_lookup(d, 1, &from_run))) {   // arch_capture_cs writes them to plain files only
@@ -8803,7 +8889,7 @@ static id<MTLComputePipelineState> cps_new(id<MTLFunction> f, NSError **e) {
         if (ps) return ps;
     }
     uint64_t t1 = bp_now();
-    ps = [g_dev newComputePipelineStateWithFunction:f error:e];
+    ps = [g_dev newComputePipelineStateWithFunction:fn_dev(f) error:e];
     if (ps) { atomic_fetch_add(&g_cps_built, 1); atomic_fetch_add(&g_cps_build_ns, bp_now() - t1); arch_harvest(d, 0); }
     return ps;
 }
@@ -9047,6 +9133,7 @@ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t 
     k->blend_en = S.color.blend_en; k->chmask = S.chmask.mask; k->a2c = S.ms.a2c; k->atest = atest_key(fs, cfmt, lmap ? g_pso_lmap : NULL);
     for (int i = 0; i < 8; i++) if (k->cfmt[i] || lmap) k->blend[i] = S.blend[i];
     k->logic = lop_key(k, fs, lmap);
+    k->border = border_need(vs, vs->stage) || border_need(fs, 1);
     const nvn_refl *rf = &vs->rf;
     for (int v = 0; v < rf->nv; v++) { int a = rf->v[v].nvn; if (a < 32 && a < S.nattr) { if (a < 16) k->attr[a] = S.attr[a]; else k->attr_hi[a - 16] = S.attr[a]; int st = S.attr[a].stream; if (st < 16) k->stream[st] = S.stream[st]; } }
     pso_key_norm(k, lmap);
@@ -9166,9 +9253,10 @@ static NSMutableSet<NSData *> *g_hy_kick_set; static os_unfair_lock g_hy_lock = 
 static MTLRenderPipelineDescriptor *pso_desc_pull(const pso_key *k, NvShader *vs, NvShader *fs) {   // pso_desc's pipeline with the pulling entry point and no vertex descriptor
     id<MTLFunction> pf = pull_fn(vs); if (!pf) return nil;
     MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0);
-    d.vertexFunction = pf; d.vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
+    d.vertexFunction = k->border ? pf : bd_off(pf); d.vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
     return d;
 }
+static int wl_bump(const char *vkey, const char *fkey);   // warm_later's order
 static __unsafe_unretained id<MTLRenderPipelineState> hybrid_get(const pso_key *k, NvShader *vs, NvShader *fs) {
     __unsafe_unretained id<MTLRenderPipelineState> h = hm_get_id(&g_pso_hy, k);
     if (h) return h;
@@ -9249,11 +9337,13 @@ static NSDictionary<NSString *, NSString *> *pre_fail_load(NSString *path, NSStr
     if ([head isEqualToString:pre_fail_head(want)]) return pairs;
     *other = 1; return @{};
 }
-static MTL4FunctionDescriptor *pre_fn(id<MTLLibrary> lib, NSString *name) {   // as shader_load notes them (fn4_note): constants specialized with an empty set
+static MTL4FunctionDescriptor *pre_fn(id<MTLLibrary> lib, NSString *name) {   // the common draw's specialization: defaults, with unused border corrections off (bd_off)
     id<MTLFunction> f = [lib newFunctionWithName:name]; if (!f) return nil;
     MTL4LibraryFunctionDescriptor *ld = [MTL4LibraryFunctionDescriptor new]; ld.library = lib; ld.name = name;
     if (!f.functionConstantsDictionary.count) return ld;
-    MTL4SpecializedFunctionDescriptor *sd = [MTL4SpecializedFunctionDescriptor new]; sd.functionDescriptor = ld; sd.constantValues = [MTLFunctionConstantValues new]; return sd;
+    MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+    if (f.functionConstantsDictionary[@"dm_border_off"]) { BOOL yes = YES; [cv setConstantValue:&yes type:MTLDataTypeBool atIndex:DMSH_BORDER_FC]; }
+    MTL4SpecializedFunctionDescriptor *sd = [MTL4SpecializedFunctionDescriptor new]; sd.functionDescriptor = ld; sd.constantValues = cv; return sd;
 }
 static NSDictionary *pre_json(NSString *key) { NSData *d = msl_data([NSString stringWithFormat:@"%@/%@_b.json", g_msl_dir, key]); return d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil; }
 // The base of one pair as the draws make it (pso_desc_pull / pso_desc), or nil when the pair is left to the draws. Call inside an autorelease pool
@@ -9512,6 +9602,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRe
                 __unsafe_unretained id<MTLRenderPipelineState> h = hybrid_get(&k, vs, fs);
                 if (h) {
                     if (st == 0) pso_pend_demand(&k, vs, fs);
+                    wl_bump(vs->key, fs ? fs->key : "");   // the pair's task in warm_later's list, if still queued, builds next (also when the pipeline is already pending)
                     g_pso_pull = 1; g_hy_ns += bp_now() - bt;
                     if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; uint64_t t0 = bp_now(); pso_predict_rest(); g_bp_pso_ns += bp_now() - t0; }
                     return h;
@@ -9559,7 +9650,7 @@ static NSString *warm_key(const char *s, size_t n) {
 // The prewarm runs the lines of its lists as tasks: a shader (S), a compute pipeline (C), or every render pipeline (R) of one shader pair. The pipelines of a pair share their
 // bases, so one worker builds them one after the other. A native mesh pipeline (M) is a separate task. The tasks keep the lists' order (a render pair at its first line).
 // Shaders share one dictionary. Only one worker prepares a key, including its pulling entry; a failed warm load stays NSNull for this prewarm only.
-@interface WarmTask : NSObject { @public int kind, stage; NSString *key, *vkey, *fkey, *tkey; NSMutableArray<NSData *> *rs; } @end
+@interface WarmTask : NSObject { @public int kind, stage; NSString *key, *vkey, *fkey, *tkey; NSMutableArray<NSData *> *rs; _Atomic int wl_st; } @end   // wl_st (warm_later): 0 queued, 1 bumped, 2 taken by a worker
 @implementation WarmTask @end
 static NSMutableDictionary *g_warm_dict; static os_unfair_lock g_warm_dict_lock = OS_UNFAIR_LOCK_INIT;
 @interface WarmLoad : NSObject { @public dispatch_group_t done; id shader; } @end
@@ -9613,16 +9704,30 @@ static void warm_enqueue(WarmItem *item) {
     os_unfair_lock_unlock(&g_warm_lock);
 }
 // The lists' lines as tasks; *lines: the lines they hold
-static NSArray<WarmTask *> *warm_parse(NSArray<NSString *> *paths, long *lines) {
+// A list's line WARM_LATER_MARK: its lines after it are built after the game's first frame (warm_start), behind every list's lines before such a line. Ocarina of Time's seed list holds
+// the title and Kokiri Forest (9,625 lines) and then a playthrough to the Forest Temple (30,530 more): before the first frame, a first start compiled 10,737 bases in 170 s (issue #1747)
+#define WARM_LATER_MARK @"#@after_first_frame"
+static NSArray<WarmTask *> *warm_parse(NSArray<NSString *> *paths, long *lines, long *first_tasks) {
     NSMutableArray<WarmTask *> *tasks = [NSMutableArray array]; NSMutableDictionary<NSString *, WarmTask *> *pairs = [NSMutableDictionary dictionary];
     NSMutableSet<NSString *> *seen = [NSMutableSet set], *stale = [NSMutableSet set]; long n = 0;
     NSMutableSet<NSData *> *seen_k = [NSMutableSet set];   // rows recorded before pso_key_norm that are one pipeline now
-    for (NSString *path in paths) {
-        NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-        if (!txt) { MLOG("[RED] cannot read prewarm list: %s", path.UTF8String); continue; }
-        { unsigned long nl = 0; for (NSString *l in [txt componentsSeparatedByString:@"\n"]) nl += l.length && ![l hasPrefix:@"#"];
-          MLOG("pipeline prewarm list %s: %lu lines", path.UTF8String, nl); }   // Diagnostics: how many lines each manifest gave (when a device warms up 0, shows which one was missing)
-        for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
+    NSMutableArray<NSString *> *later = [NSMutableArray array];   // the lines after WARM_LATER_MARK, parsed after every list
+    for (NSUInteger pi = 0; pi <= paths.count; pi++) {
+        NSArray<NSString *> *list;
+        if (pi < paths.count) {
+            NSString *path = paths[pi], *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+            if (!txt) { MLOG("[RED] cannot read prewarm list: %s", path.UTF8String); continue; }
+            list = [txt componentsSeparatedByString:@"\n"];
+            NSUInteger mark = [list indexOfObjectPassingTest:^BOOL(NSString *l, NSUInteger i, BOOL *stop) { (void)i; (void)stop;
+                return [[l stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] isEqualToString:WARM_LATER_MARK]; }];
+            { unsigned long nl = 0, nb = 0; for (NSUInteger i = 0; i < list.count; i++) { int row = list[i].length && ![list[i] hasPrefix:@"#"]; nl += row; nb += row && mark != NSNotFound && i > mark; }
+              MLOG("pipeline prewarm list %s: %lu lines%s", path.UTF8String, nl, nb ? [NSString stringWithFormat:@", %lu of them after its first frame mark", nb].UTF8String : ""); }   // Diagnostics: how many lines each manifest gave (when a device warms up 0, shows which one was missing)
+            if (mark != NSNotFound) { [later addObjectsFromArray:[list subarrayWithRange:NSMakeRange(mark + 1, list.count - mark - 1)]]; list = [list subarrayWithRange:NSMakeRange(0, mark)]; }
+        } else {
+            *first_tasks = (long)tasks.count;   // a pair's rows after the mark join its task among these (warm_lines)
+            list = later;
+        }
+        for (NSString *line in list) {
             if (!line.length || [line hasPrefix:@"#"] || [seen containsObject:line]) continue;
             [seen addObject:line];
             NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
@@ -9659,6 +9764,10 @@ static NSArray<WarmTask *> *warm_parse(NSArray<NSString *> *paths, long *lines) 
     }
     *lines = n; return tasks;
 }
+static long warm_lines(NSArray<WarmTask *> *tasks, long from, long to) {   // the list lines tasks [from, to) build: one each, a pair's render pipelines one per row
+    long n = 0; for (long i = from; i < to; i++) n += tasks[(NSUInteger)i]->kind == 1 ? (long)tasks[(NSUInteger)i]->rs.count : 1;
+    return n;
+}
 static void warm_task(WarmTask *t) {
     @autoreleasepool {
         if (t->kind == 0) {
@@ -9667,7 +9776,7 @@ static void warm_task(WarmTask *t) {
             g_warm_done++; return;
         }
         if (t->kind == 2) {
-            NvShader *cs = warm_shader(t->key, 5); NSError *e = nil; id ps = cs ? cps_new(cs->fn, &e) : nil;
+            NvShader *cs = warm_shader(t->key, 5); NSError *e = nil; id ps = cs ? cps_new(bd_off(cs->fn), &e) : nil;   // the common function (g_cps)
             if (cs && !ps) MLOG("[RED] background compute pipeline creation failed: %s", e.localizedDescription.UTF8String);
             if (ps) { WarmItem *item = [WarmItem new]; item->kind = 2; item->key = t->key; item->shader = cs; item->object = ps; warm_enqueue(item); g_warm_cps++; }
             g_warm_done++; return;
@@ -9800,6 +9909,84 @@ static void prepare_prebuild(void) {
     if (left > 0) MLOG("pipeline prepare: every shader pair handed out after %.1f s; %d compiles still under way finish in the background", (bp_now() - t0) / 1e9, left);
     if (shown) front_progress(NULL, n, n);
 }
+// The background list's order. Workers take the next task of the list, but a task a draw asked for (wl_bump: the draw has its shader pair's pulling stand-in because the pair's
+// pipelines are still queued here) goes first, so the area the player is in builds before the rest of the playthrough. A task is built once: wl_st goes to 2 by exchange, whoever
+// gets it from 0 or 1 builds it. The table of pairs is built once and only read afterwards (the draw thread takes no lock unless it bumps a task that was still queued)
+typedef struct { uint64_t h; __unsafe_unretained WarmTask *t; char *v, *f; } wl_slot;   // the pair's keys are copied: the draw thread compares C strings, no message sends
+typedef struct { size_t mask; wl_slot s[]; } wl_table;
+static _Atomic(wl_table *) g_wl_tab; static NSArray<WarmTask *> *g_wl_rest; static _Atomic long g_wl_next; static _Atomic int g_wl_live, g_wl_nbump;
+static os_unfair_lock g_wl_lock = OS_UNFAIR_LOCK_INIT; static NSMutableArray<WarmTask *> *g_wl_bumps; static NSUInteger g_wl_bhead; static _Atomic uint64_t g_wl_bumped, g_wl_miss;
+static uint64_t wl_hash(const char *v, const char *f) { uint64_t h = 1469598103934665603ull; for (; *v; v++) h = (h ^ (uint8_t)*v) * 1099511628211ull; h = (h ^ 0xff) * 1099511628211ull; for (; f && *f; f++) h = (h ^ (uint8_t)*f) * 1099511628211ull; return h | 1; }
+static wl_slot *wl_find(wl_table *tb, const char *v, const char *f) {   // the pair's slot, or the empty slot where it would go
+    uint64_t h = wl_hash(v, f); size_t i = h & tb->mask;
+    while (tb->s[i].h && !(tb->s[i].h == h && !strcmp(tb->s[i].v, v) && !strcmp(tb->s[i].f, f ? f : ""))) i = (i + 1) & tb->mask;
+    return &tb->s[i];
+}
+// Once per list, before any worker or bump. The table is published whole; an older one (a second list in a test) stays allocated, as a draw may still be probing it
+static void wl_init(NSArray<WarmTask *> *rest) {
+    atomic_store(&g_wl_live, 0); g_wl_rest = rest; atomic_store(&g_wl_next, 0); atomic_store(&g_wl_nbump, 0); atomic_store(&g_wl_bumped, 0); atomic_store(&g_wl_miss, 0); g_wl_bumps = [NSMutableArray array]; g_wl_bhead = 0;
+    size_t cap = 16; while (cap < rest.count * 2) cap <<= 1;
+    wl_table *tb = calloc(1, sizeof *tb + cap * sizeof(wl_slot)); tb->mask = cap - 1;
+    for (WarmTask *t in rest) {
+        atomic_store(&t->wl_st, 0);
+        if (t->kind != 1) continue;
+        wl_slot *sl = wl_find(tb, t->vkey.UTF8String, t->fkey.UTF8String);
+        if (!sl->h) { sl->h = wl_hash(t->vkey.UTF8String, t->fkey.UTF8String); sl->t = t; sl->v = strdup(t->vkey.UTF8String); sl->f = strdup(t->fkey.UTF8String); }   // a pair named twice stays one task (warm_parse joins its rows)
+    }
+    atomic_store(&g_wl_tab, tb); atomic_store(&g_wl_live, 1);
+}
+static WarmTask *wl_next(void) {   // the next task to build, nil at the end of the list
+    for (;;) {
+        if (atomic_load(&g_wl_nbump) > 0) {
+            WarmTask *b = nil; os_unfair_lock_lock(&g_wl_lock);
+            if (g_wl_bhead < g_wl_bumps.count) { b = g_wl_bumps[g_wl_bhead++]; atomic_fetch_sub(&g_wl_nbump, 1); }   // in the order the draws asked (the first ask is the nearest draw); no ask starves
+            if (g_wl_bhead == g_wl_bumps.count) { [g_wl_bumps removeAllObjects]; g_wl_bhead = 0; }
+            os_unfair_lock_unlock(&g_wl_lock);
+            if (b) { if (atomic_exchange(&b->wl_st, 2) == 2) continue; return b; }
+        }
+        long i = atomic_fetch_add(&g_wl_next, 1); if (i >= (long)g_wl_rest.count) return nil;
+        WarmTask *t = g_wl_rest[(NSUInteger)i]; if (atomic_exchange(&t->wl_st, 2) == 2) continue;   // already built as a bumped task
+        return t;
+    }
+}
+// A draw falls back to its pair's pulling pipeline: move the pair's task to the front if it is still queued. Returns 1 when it was moved. Safe from any thread
+static int wl_bump(const char *vkey, const char *fkey) {
+    if (!atomic_load(&g_wl_live)) return 0;
+    wl_slot *sl = wl_find(atomic_load(&g_wl_tab), vkey, fkey);
+    WarmTask *t = sl->h ? sl->t : nil; if (!t) { atomic_fetch_add(&g_wl_miss, 1); return 0; }   // a pair the list does not hold (built before the mark, or in no list)
+    int z = 0; if (!atomic_compare_exchange_strong(&t->wl_st, &z, 1)) return 0;   // taken or bumped already
+    os_unfair_lock_lock(&g_wl_lock); [g_wl_bumps addObject:t]; atomic_fetch_add(&g_wl_nbump, 1); os_unfair_lock_unlock(&g_wl_lock);
+    atomic_fetch_add(&g_wl_bumped, 1); return 1;
+}
+// The lines after the lists' WARM_LATER_MARK, built after the game's first frame: as the background prewarm builds without a prepare step, but on half the performance cores at
+// utility QoS, as pso_prebuild_bg builds, so the game keeps its frame rate meanwhile; a draw whose pipeline is not built yet draws with its shader pair's pulling pipeline (hybrid),
+// whose bases the prepare step's prebuild made. Only on a start that does not compact the archive (warm_start): the prewarm stays running (g_warm_running) until warm_finish at
+// the end, which matters to the archive only while compacting (the recapture and the held flushes), so what it builds is captured as any compile at run time is
+static void warm_later(NSArray<WarmTask *> *rest, long rest_lines) {
+    int pc = 0; size_t sz = sizeof pc; if (sysctlbyname("hw.perflevel0.physicalcpu", &pc, &sz, NULL, 0) || pc <= 1) pc = 4;
+    int workers = pc > 4 ? pc / 2 : 2; uint64_t t0 = bp_now();
+    MLOG("pipeline prewarm: %ld lines after the first frame, on %d workers", rest_lines, workers);
+    wl_init(rest);
+    dispatch_group_t g = dispatch_group_create();
+    for (int w = 0; w < workers; w++) dispatch_group_async(g, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        for (;;) { @autoreleasepool { WarmTask *t = wl_next(); if (!t) break; warm_task(t); t->rs = nil; } }   // a built task keeps nothing (the table holds the task and its keys)
+    });
+    dispatch_group_notify(g, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ @autoreleasepool {
+        atomic_store(&g_wl_live, 0);
+        MLOG("pipeline prewarm: the %ld lines after the first frame done in %.1f s (%llu pairs moved to the front by draws; %llu stand-in pipelines named a pair the list does not hold)", rest_lines, (bp_now() - t0) / 1e9, (unsigned long long)atomic_load(&g_wl_bumped), (unsigned long long)atomic_load(&g_wl_miss));
+        warm_finish();
+    } });
+}
+// How many tasks the prepare step builds before the first frame: the lines after a WARM_LATER_MARK wait for it only with hybrid draws (a pulling pipeline stands in meanwhile) and on a
+// start that does not compact the archive. A compaction recaptures every base the prewarm finds before it removes the old files, and such a start finds them all in the archive, which
+// takes seconds; deferring part of it was left out (a crash inside Metal's compiler on a compacting start, the #342 family)
+static long warm_first_part(long first, long total, int hybrid) {
+    if (first < total && (!hybrid || g_compact_enabled)) {
+        MLOG("pipeline prepare: the lines after the first frame mark are prepared too (%s)", g_compact_enabled ? "this start compacts the pipeline archive" : "no hybrid draws");
+        return total;
+    }
+    return first;
+}
 static void warm_start(void) {
     if (g_warm_started++) return;
     const char *e = getenv("DM_PSO_MANIFEST");
@@ -9825,16 +10012,23 @@ static void warm_start(void) {
     g_warm_t0 = bp_now();
     atomic_store(&g_warm_running, 1);
     if (prepare_on()) {
-        long lines = 0; NSArray<WarmTask *> *tasks = warm_parse(paths, &lines);
-        if (lines) warm_prepare(tasks, lines);
-        else MLOG("pipeline prepare: the prewarm lists hold nothing to build");
-        warm_finish();
-        @autoreleasepool { prepare_prebuild(); }   // then the bases every shader pair's hybrid draws need, before the first frame too (once)
+        long lines = 0, first = 0; NSArray<WarmTask *> *tasks = warm_parse(paths, &lines, &first);
+        first = warm_first_part(first, (long)tasks.count, hybrid_on());
+        long first_lines = first == (long)tasks.count ? lines : warm_lines(tasks, 0, first);
+        if (first_lines) warm_prepare(first == (long)tasks.count ? tasks : [tasks subarrayWithRange:NSMakeRange(0, (NSUInteger)first)], first_lines);
+        else if (!lines) MLOG("pipeline prepare: the prewarm lists hold nothing to build");
+        if (first == (long)tasks.count) {
+            warm_finish();
+            @autoreleasepool { prepare_prebuild(); }   // then the bases every shader pair's hybrid draws need, before the first frame too (once)
+            return;
+        }
+        @autoreleasepool { prepare_prebuild(); }   // the pulling bases before the first frame, as above; no compaction holds its flushes
+        warm_later([tasks subarrayWithRange:NSMakeRange((NSUInteger)first, tasks.count - (NSUInteger)first)], lines - first_lines);
         return;
     }
     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);   // Not optional background work: it decides whether the pipelines are ready before the player enters a run
     dispatch_queue_t q = dispatch_queue_create("dm.nvn.pso-warm", attr);
-    dispatch_async(q, ^{ @autoreleasepool { long lines = 0; for (WarmTask *t in warm_parse(paths, &lines)) warm_task(t); warm_finish(); } });
+    dispatch_async(q, ^{ @autoreleasepool { long lines = 0, first = 0; for (WarmTask *t in warm_parse(paths, &lines, &first)) warm_task(t); warm_finish(); } });
 }
 static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {
     struct { ds_st ds; uint32_t vm[2], wm[2]; int hd, hs; } k;
@@ -10570,6 +10764,34 @@ static int sampu_id(int stage, const nvn_rbind *b, int k) {
     if (b->soff && b->sreg == DMSH_SREG_C2) return (int)(c2_handle(stage, b->soff - 1u) >> 20);
     return k < 0 ? ubo_samp_id(ubo_bind_handle(stage, b)) : ubo_samp_id(ubo_handle(stage, b->reg, b->off + 8 * k));
 }
+// The sampler ID a sampler binding reads in the current state: SAMPT the sampler part of a combined handle (texture ID | sampler ID << 20), SAMPU the same with the handle in a uniform buffer,
+// SAMPI a sampler ID the shader names as a constant
+static int bind_sid(int nvn_stage, const nvn_rbind *b) {
+    int reg = b->reg;
+    return b->kind == NVN_RB_SAMPU ? sampu_id(nvn_stage, b, -1) :
+           b->kind == NVN_RB_SAMPI ? reg : b->kind == NVN_RB_SAMPT ? (reg < NTEX ? (int)(S.tex[nvn_stage][reg] >> 20) : 0) : reg < 128 ? (int)(S.samp[nvn_stage][reg] >> 20) : 0;
+}
+// Whether a draw of sh binds a sampler with a twin (dmsh_build.py border_emu, nvn_border.h), whose samples it must correct: then its pipeline keeps the corrections (pso_key.border),
+// otherwise it is specialized without them (bd_off). Inspect the registered parameters: the pipeline is chosen before encode_args creates Metal samplers, including their twins
+// DM_NVN_BORDER_KEEP=1 keeps the corrections in every pipeline (diagnostic: a wrong border colour with the specialization, or its cost: ab with DM_AB)
+static int border_need(NvShader *sh, int nvn_stage) {
+    static int keep = -1; if (keep < 0) keep = sw_mode("DM_NVN_BORDER_KEEP", 0);
+    if (sh && sh->rf.border && sw_on(keep)) return 1;
+    if (!sh || !sh->rf.border || !atomic_load_explicit(&g_border_any, memory_order_relaxed)) return 0;
+    int need = 0;
+    os_unfair_lock_lock(&g_rmu);
+    for (int i = 0; i < sh->rf.nb && !need; i++) {
+        const nvn_rbind *b = &sh->rf.b[i];
+        if (!b->bw || (b->kind != NVN_RB_SAMP && b->kind != NVN_RB_SAMPT && b->kind != NVN_RB_SAMPU && b->kind != NVN_RB_SAMPI)) continue;
+        int sid = bind_sid(nvn_stage, b);
+        if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) {
+            const samp_par *p = &g_sreg[sid]; int bn, bw; float k[4]; const uint8_t wrap[3] = {p->ws, p->wt, p->wr};
+            need = nvn_border(p->border, wrap, p->reduction, &bn, &bw, k);
+        }
+    }
+    os_unfair_lock_unlock(&g_rmu);
+    return need;
+}
 // A table of the handles in one of the game's uniform buffers, which a shader indexes at run time (element k = the handle at off + 8k): nothing tells how many the game keeps there, and the argument
 // buffer has one pointer for it, so the table is as long as the last handle the buffer holds. Kirby Air Riders keeps 197 handles up to element 392 in a 4,096-element buffer, and 34,000 textures
 // registered: only those a table names are made here, where pool_gpu's walk over every ID took 16 GB and most of the frame. A table is looked at again in each pass, and rebuilt when the handles or the
@@ -10816,8 +11038,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             }
             if (!(sh->logged & 4)) { sh->logged |= 4; static int nlog; if (nlog++ < 32) MLOG("shader %s (stage %d): an array of %d handles in uniform slot %d, elements %#llx hold textures", sh->key, nvn_stage, b->n, reg, (unsigned long long)real); }
         } else if (b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT || b->kind == NVN_RB_SAMPU || b->kind == NVN_RB_SAMPI) {   // SAMPT: the sampler part of a combined handle (texture ID | sampler ID << 20); SAMPU: the same, with the handle in a uniform buffer
-            int sid = b->kind == NVN_RB_SAMPU ? sampu_id(nvn_stage, b, -1) :
-                      b->kind == NVN_RB_SAMPI ? (int)reg : b->kind == NVN_RB_SAMPT ? (reg < NTEX ? (int)(S.tex[nvn_stage][reg] >> 20) : 0) : reg < 128 ? (int)(S.samp[nvn_stage][reg] >> 20) : 0;   // SAMPI: a sampler ID the shader names as a constant
+            int sid = bind_sid(nvn_stage, b);
             __unsafe_unretained id<MTLSamplerState> ss = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
             if (b->bw && ss && g_sview_w[sid]) {   // a twin (dmsh_build.py border_emu) of a sampler whose border colour Metal lacks: the shader corrects its samples
                 ss = (__bridge id<MTLSamplerState>)g_sview_w[sid]; slots[aid] = g_srid_w[sid];
@@ -12838,6 +13059,44 @@ static int fb_texu_reads(NvShader *fs, uint64_t ser) {
             if (s == ser) return 1; } }
     return 0;
 }
+// A draw that writes depth or stencil and samples its own depth attachment through a bound texture reads a copy of it. On the console each fragment reads the depth stored before
+// the draw; on Apple's GPUs a depth attachment sampled by the pass that renders into it reads whole compressed blocks of undefined content. Ocarina of Time's cave and cliff fixtures
+// (25a8adc977ff813d, a full-screen triangle that samples the scene depth and writes it with LEQUAL, then its decals) painted black and sky-blue blocks over the rock. The copy is taken
+// after the pass ends and reused until the game's next barrier, as the colour snapshots are (NVN makes rendering visible to texture reads only through a barrier): at Death Mountain
+// Trail's cave entrance 1,000 such draws took about 190 copies, with the same picture as a copy for each. DM_NVN_FB_DSNAP=0 reads the attachment directly, as before
+static uint64_t g_fb_dsnaps, g_fb_dsnap_reuse; static int g_fb_dsnap_m = -1;
+static int fb_dsnap_on(void) {
+    if (g_fb_dsnap_m < 0) { const char *e = getenv("DM_NVN_FB_DSNAP"); g_fb_dsnap_m = !(e && !strcmp(e, "0")); if (!g_fb_dsnap_m) MLOG("same-pass depth sampling: draws that write depth read their depth attachment directly (DM_NVN_FB_DSNAP=0)"); }
+    return g_fb_dsnap_m;
+}
+static int fb_depth_snap(NvShader *fs, const nvn_rbind *b, int tid, uint64_t ser) {
+    if (g_fb_n >= 4 || b->dtt != MTLTextureType2D) return 0;
+    uint64_t dser; int lv, sl; rt_sub(&R.rt, 8, &dser, &lv, &sl);
+    os_unfair_lock_lock(&g_rmu); void *tv = NULL; tex_fast_rid(tid, &tv); id<MTLTexture> t = (__bridge id<MTLTexture>)tv; os_unfair_lock_unlock(&g_rmu);
+    if (!t || t.textureType != MTLTextureType2D || t.sampleCount != 1 || t.mipmapLevelCount != 1) return 0;
+    for (int q = 0; q < g_fb_n; q++) if (g_fb_src[q] == t) return 1;
+    id<MTLTexture> base = t.parentTexture ? t.parentTexture : t; NSUInteger tl = t.parentTexture ? t.parentRelativeLevel : 0, ts = t.parentTexture ? t.parentRelativeSlice : 0;
+    if (base.parentTexture || tl != (NSUInteger)lv || ts != (NSUInteger)sl) return 0;
+    NSUInteger w = MAX(base.width >> lv, 1ul), h = MAX(base.height >> lv, 1ul); int fresh;
+    fb_cache_t *e = fb_snap(ser, lv, sl, base.pixelFormat, w, h, g_fb_mode == 2, &fresh); if (!e) return 0;
+    MTLTextureSwizzleChannels sw = t.swizzle;
+    int same = t.pixelFormat == e->snap.pixelFormat && sw.red == MTLTextureSwizzleRed && sw.green == MTLTextureSwizzleGreen && sw.blue == MTLTextureSwizzleBlue && sw.alpha == MTLTextureSwizzleAlpha;
+    id<MTLTexture> use = same ? e->snap : [e->snap newTextureViewWithPixelFormat:t.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1) swizzle:sw];
+    if (!use) { e->ser = 0; RED_ONCE(161, "same-pass depth sampling: cannot create the snapshot view (format %lu); left as is", (unsigned long)t.pixelFormat); return 0; }
+    if (fresh) {
+        if (g_enc) { g_fb_split++; rp_end(); }
+        enc_b_copy_texture(blit(), base, (NSUInteger)sl, (NSUInteger)lv, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), e->snap, 0, 0, MTLOriginMake(0, 0, 0));
+        fb_pass_sync();
+    } else g_fb_dsnap_reuse++;
+    if (g_fb_use[g_fb_n] && g_fb_use[g_fb_n] != use) defer_obj_unref(g_fb_use[g_fb_n]);
+    g_fb_src[g_fb_n] = t; g_fb_use[g_fb_n] = use; g_fb_rid[g_fb_n] = use.gpuResourceID._impl; g_fb_n++;
+    if (!fresh) { PD("N %llu same-pass depth sampling: depth ser=%llu level %d layer %d: this draw samples the copy taken since the last barrier", g_stat_pass + !g_enc, (unsigned long long)ser, lv, sl); return 1; }
+    if (++g_fb_dsnaps == 1 || g_fb_dsnaps == 10 || g_fb_dsnaps == 1000 || g_fb_dsnaps % 100000 == 0)
+        MLOG("same-pass depth sampling: copy #%llu, %llu draws reused one (frame %llu pass %llu, shader %s slot %d samples its depth attachment ser=%llu %lux%lu format %lu while writing it)", (unsigned long long)g_fb_dsnaps,
+             (unsigned long long)g_fb_dsnap_reuse, (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass + !g_enc, fs->key, b->reg, (unsigned long long)ser, (unsigned long)w, (unsigned long)h, (unsigned long)base.pixelFormat);
+    PD("N %llu same-pass depth sampling: depth ser=%llu level %d layer %d copied into a snapshot; this draw samples the snapshot", g_stat_pass + !g_enc, (unsigned long long)ser, lv, sl);
+    return 1;
+}
 // Called before the draw opens its render pass: if a snapshot is needed, end the current render pass, copy the snapshot (or reuse a valid one) and register the substitution (used by this draw's argument encoding)
 static void fb_prepare(NvProg *pr) {
     g_draw_seq++; g_fb_n = 0;
@@ -12866,6 +13125,7 @@ static void fb_prepare(NvProg *pr) {
         os_unfair_lock_lock(&g_rmu); uint64_t ser = tid < g_ntreg && g_treg[tid].ok ? g_treg[tid].t.serial : 0; os_unfair_lock_unlock(&g_rmu);
         if (!ser) continue;
         if (R.rt.depth && R.rt.depth->serial == ser) {
+            if (!image && dsw && fb_dsnap_on() && fb_depth_snap(fs, b, tid, ser)) continue;   // it writes depth too: it reads a copy (fb_depth_snap)
             if (g_enc && g_fb_dwrite) { g_fb_split++; rp_end(); fb_pass_sync(); }
             dread = 1;
         }
@@ -13890,7 +14150,11 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     }
     if (g_rt_range_pending) { PD("j rt_level_range pass=%llu vc=%u", g_stat_pass, (unsigned)(dw ? dw->count : di->count)); g_rt_range_pending=0; }
 }
-static nvn_hmap g_cps = {.klen = sizeof(void *)};
+// Compute pipelines by shader and whether the pipeline is without the border corrections: a dispatch takes that function unless a sampler it binds needs them (border_need, bd_off),
+// as a draw does, and the prewarm builds the common one
+typedef struct { const void *cs; uintptr_t off; } cps_key;
+static nvn_hmap g_cps = {.klen = sizeof(cps_key)};
+static id<MTLFunction> cs_fn(NvShader *cs, int off) { return off ? bd_off(cs->fn) : cs->fn; }
 // shader_load can return distinct objects for a prefetch and a warm task. The library key is
 // immutable during a run; the selected entry (including entry_z) distinguishes depth variants.
 // Both loaders use the library's default function constants. Never equate unnamed test/stub shaders.
@@ -13930,7 +14194,7 @@ static void warm_claim(void) {
         } else {
             NvShader *cs = g_shcache[item->key];
             if (!cs) { cs = item->shader; if (!g_shcache) g_shcache = [NSMutableDictionary dictionary]; g_shcache[item->key] = cs; }
-            const void *key = (__bridge const void *)cs;
+            cps_key key = {(__bridge const void *)cs, 1};   // warm_task built the common function, without the border corrections
             if (!hm_get_id(&g_cps, &key)) { hm_put_id(&g_cps, &key, item->object); g_warm_claim_cps++; }
         }
     }
@@ -14092,11 +14356,12 @@ static void dispatch(const p_dispatch *dp, const uint8_t *next) {
     int ndve = !dp->ind && dp->x && dp->y && dp->z == 1 ? ndve_direct_role(cs) : 0;
     if (ndve == 1) g_ndve_decoded = nil;
     if (ndve == 2 && g_ndve_sub == g_sub_serial && g_ndve_decoded && ndve_direct_draw(cs)) return;
-    const void *k = (__bridge const void *)cs;
+    int off = !border_need(cs, 5);
+    cps_key k = {(__bridge const void *)cs, (uintptr_t)off};
     id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
     if (!ps) {
         if (cs->cps_failed) return;   // the same function fails the same way: asked again at every dispatch, Mario Kart World's refused shaders took 3,138 pipeline builds in 60 s
-        NSError *e = nil; uint64_t bt = bp_now(); ps = cps_new(cs->fn, &e);
+        NSError *e = nil; uint64_t bt = bp_now(); ps = cps_new(cs_fn(cs, off), &e);
         g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
         if (!ps) { cs->cps_failed = 1; MLOG("[RED] failed to create compute pipeline for %s: %s (its dispatches are skipped)", cs->key, e.localizedDescription.UTF8String); return; }
         pso_record("C\t%s\n", cs->key);
