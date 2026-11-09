@@ -126,6 +126,9 @@ def info_plist(a, minos, icon):
          'NSBluetoothAlwaysUsageDescription': 'Connect Switch 2 Joy-Con and Pro Controllers over Bluetooth.',
          'LSApplicationCategoryType': a.category or 'public.app-category.games', 'LSSupportsGameMode': False, 'DMTitleID': a.title_id.upper(), 'DMRomfsMarker': a.marker or '', 'DMLanguage': a.lang or 'en-US', 'DMSaveSyncChoice': 1}
     if icon: p['CFBundleIconFile'] = 'AppIcon'
+    # DM_APP_GAME_MODE=1 when packing: an app that asks for Game Mode and whose launcher hands its process to the host (launcher.c DM_LAUNCH_EXEC), for a Mac where Game Mode
+    # helps more than its GPU clock rule costs. The default stays off, for the reason above
+    if os.environ.get('DM_APP_GAME_MODE') == '1': p['LSSupportsGameMode'] = True; p['GCSupportsGameMode'] = True; p['DMLaunchExec'] = '1'
     # macOS asks the player before the host captures the microphone (DM_MIC=1, hle_audio.c input streams); without this key the capture is refused without asking
     p['NSMicrophoneUsageDescription'] = "A game that uses a microphone hears this Mac's input only when DM_MIC=1 is set (Ocarina of Time: the ocarina played into it)."
     if a.settings:

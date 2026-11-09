@@ -219,6 +219,23 @@ int main(int argc, char **argv) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGTERM, &sa, NULL); sigaction(SIGINT, &sa, NULL); sigaction(SIGHUP, &sa, NULL);
     char *host_argv[] = {host, dm, NULL};
+    // Game Mode build (Info.plist DMLaunchExec 1, pack_app.py with DM_APP_GAME_MODE=1; DM_LAUNCH_EXEC=0 / 1 in the environment or an env file overrides it): the host takes this
+    // process's place instead of running as its child. macOS gives Game Mode and the foreground application's scheduling to the process LaunchServices started, the bundle's own,
+    // and a child gets neither (the window, the GPU work and the frame deadline are all the host's). What the child form does after the host exits is lost: the cloud save's last
+    // send waits for the next start, and the log has no exit line. Not for an app off the startup volume: macOS privacy checks refuse every open on a removable volume to a
+    // process that was exec'ed (the reason the host is otherwise a child, top of this file), so the host runs as a child there
+    char exec_s[8] = ""; const char *ex = getenv("DM_LAUNCH_EXEC");
+    if (!ex && info_string("DMLaunchExec", exec_s, sizeof exec_s)) ex = exec_s;
+    if (ex && !strcmp(ex, "1")) {
+        struct stat root_st, host_st;
+        if (!stat("/System/Volumes/Data", &root_st) && !stat(host, &host_st) && root_st.st_dev != host_st.st_dev)
+            fprintf(stderr, "launcher: DM_LAUNCH_EXEC asked, but the app is not on the startup volume: the host runs as a child\n");
+        else {
+            fprintf(stderr, "launcher: the host takes this process's place (DM_LAUNCH_EXEC: Game Mode and the app's scheduling are the host's)\n");
+            execve(host, host_argv, environ);
+            fprintf(stderr, "[RED] launcher: exec of %s failed (%s): the host runs as a child\n", host, strerror(errno));
+        }
+    }
     int err = posix_spawn(&g_child, host, NULL, NULL, host_argv, environ);
     if (err) { fprintf(stderr, "[RED] launcher: cannot start %s: %s\n", host, strerror(err)); return 1; }
     int status;
