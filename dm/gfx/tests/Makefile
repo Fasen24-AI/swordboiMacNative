@@ -127,6 +127,10 @@ t_res_guard: t_res_guard.m $(MTL_T_DEP)
 check_t_res_guard: t_res_guard
 	MTL_DEBUG_LAYER=1 ./t_res_guard
 	MTL_DEBUG_LAYER=1 ./t_res_guard stuck
+# The game's dispatches side by side in the copy encoder where no barrier of its and nothing else lies between them (dispatch_enc, DM_NVN_DISPATCH_OVERLAP)
+t_dispatch_overlap: t_dispatch_overlap.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_overlap.m $(MTL_T_SRC) $(FW)
+check_t_dispatch_overlap: RUN_ENV = MTL_DEBUG_LAYER=1
 .PHONY: check_t_cpu_tex
 check_t_cpu_tex: t_cpu_tex
 	MTL_DEBUG_LAYER=1 ./t_cpu_tex --metal
@@ -592,3 +596,8 @@ t_render_counter_overlap: t_render_counter_overlap.m $(MTL_T_DEP)
 check_t_render_counter_overlap: t_render_counter_overlap
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./$<
 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./$<
+
+t_fragment_uniform: t_fragment_uniform.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ $< $(MTL_T_SRC) $(FW)
+check_t_fragment_uniform: t_fragment_uniform
+	python3 test_dmsh_ubo.py --gpu ./t_fragment_uniform

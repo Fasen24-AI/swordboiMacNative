@@ -3094,6 +3094,12 @@ NVN(nvnTextureWriteTexelsStrided, void, const NVNtexture *t, const NVNtextureVie
 // slice: LEGO Star Wars: The Skywalker Saga fills its BC6H light-probe volumes a slice at a time with buffer copies, then moves them into new textures by copying their storage, and
 // with 3D left out the moved volumes held the pool's old bytes and every dynamically lit object came out at the half-float maximum, white (GitHub #1856). −1 when the copy cannot be
 // mirrored (a format mismatch, a region out of range): the GPU copy alone then stands until the next upload
+int nvn_tex_level_range(const tex_t *t, unsigned level, unsigned layer, uint64_t *lo, uint64_t *hi) {
+    uint64_t a = nvn_tex_level_offset(&t->d, level), b = level + 1 < t->d.levels ? nvn_tex_level_offset(&t->d, level + 1) : t->L.layer_size;
+    if (b <= a || b > t->L.layer_size || (uint64_t)layer * t->L.layer_size + b > t->L.size) return -1;
+    *lo = (uint64_t)layer * t->L.layer_size + a; *hi = (uint64_t)layer * t->L.layer_size + b;
+    return 0;
+}
 static int mirror_prepare(const tex_t *t, unsigned level, unsigned layer) {   // unprotect (and mark written) the storage of one level of one layer
     uint64_t lo, hi; if (nvn_tex_level_range(t, level, layer, &lo, &hi)) return -1;
     dm_guest_write_prepare(t->mem + lo, hi - lo);

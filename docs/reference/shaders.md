@@ -1230,6 +1230,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** [Pokémon Pokopia](../../dm/games/0400A3A01EE4C000/README.md): 25,726 of its shaders use those forms; `85446a6753300fc8` is the blur.
 - **Check:** `DMSH_TEST_XLATE=<translator> python3 dm/gfx/tests/test_dmsh_ampere_mem.py` (`Pokopia`: constants, a negative immediate's sign) and `DMSH_TEST_XLATE=<translator> python3 dm/gfx/tests/test_dmsh_ampere_alu.py` (`HalfImmediate`: on a live register).
 
+### HFMA2 rounds twice to half
+
+- **Symptom:** none seen in a game. Against a Jetson Orin (sm_87, PTX `fma.rn.f16x2`, 1,048,576 random triples with denormals, Inf and NaN, plus 24,389 edge triples), 70 of 2,097,152 lanes differed by one half ULP (99.9967 percent identical), e.g. -3136 × -8.125 + 0.000124693: Orin 25488, Metal 25472.
+- **Cause:** the translator writes HFMA2 as `fma(a, b, c)` on the halves unpacked to float and packs with `half2(float2(..))`: one rounding to float, then another to half. The hardware rounds `a * b + c` once. When the float result lands on the midpoint of two halves and the exact one does not, the two roundings disagree.
+- **Fix:** `dmsh_build.py` `hfma_msl` rewrites an `fma` whose three operands are halves (unpacked, negated, or a literal a half holds) and whose every use ends in a pack to half (through `.SAT`'s clamp and `.RELU`'s max) to `dmsh_hfma`: the float result rounded to odd, from a TwoSum of the exact product and the addend, so the conversion to half rounds the exact value once. The helper is compiled with `#pragma METAL fp math_mode(safe)` and contraction off: fast math otherwise folds the TwoSum and 26 of the 70 lanes stay wrong. An FFMA then F2FP, and HFMA2.F32, are left alone (the hardware rounds twice there too).
+- **Check:** `test_dmsh_hfma.py`: the fixture is 1,500 of the Orin's edge triples and the 70 lanes; after the rewrite 0 of 2,097,152 differ, in default, fast, safe and relaxed math.
+
 ### HFMA2 .H0_NH1
 
 - **Symptom:** wrong shading where a shader needs a cross product or a 2D rotation of half pairs; on Eden-NS2, which first read the mode as a plain negation of the high lane, sun and cloud shadows were lost.
@@ -1465,6 +1472,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Fix:** `dmsh_build.py` `HMMA_BODY` computes C and D in matrices of its own; a slot is read only for a chain's C (`FlagCSlot`) and written only for its D (`FlagDSlot`). The flags are constants at each inlined call, so the copies cost nothing. A chain change.
 - **Check:** `test_dmsh_hmma.py` `HmmaOnGpu.test_calls_outside_a_chain_leave_its_slot_alone` (a chain in slot 0 around two calls outside it, on the GPU against a CPU reference): 8,090 outputs over tolerance (largest error 9.6) with the helper before, none after. Ocarina of Time on an M4 Pro, the same Kokiri Forest view: rows on chain 23a1ea1db092 and later; none on 0f510fd5's chain, with the helper's rewrite left out, or with this fix.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (GitHub issue #1537). Counted in the translated MSL (calls outside a chain while slot 0 is held): Ocarina of Time 3,700 in 52 of its 62 HMMA shaders (its NDSR upscaler and movie networks too); [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md)'s NDSR 7 in 5 of its 24, so a few of its outputs were wrong as well (not looked at in the game).
+
+### HMMA rounds its f16 accumulator once per 8 products
+
+- **Symptom:** a Switch 2 game's movie or upscaler network gives values a few f16 steps off the console's, in about half the outputs of each HMMA. Nothing looks broken; it is the network's arithmetic, compounded layer by layer.
+- **Cause:** `HMMA_BODY` accumulated on `simdgroup_half8x8`, whose multiply-accumulate rounds the f16 accumulator after every product. Ampere's HMMA with an f16 accumulator adds 8 products to C and rounds once (Khattak and Mikaitis's A100 model, N_FMA 8; [MATLAB-tensor-core](https://github.com/north-numerical-computing/MATLAB-tensor-core)): an HMMA.16816 is k 0-7 rounded to f16, then k 8-15 on top, rounded again. Against the toolbox's 5,000 recorded A100 fp16 cases (C as f16), per-product rounding matches 2,420; summing the 8 products in f32 and rounding once matches all 5,000.
+- **Fix:** `HMMA_BODY` accumulates each block of 8 into a `simdgroup_float8x8` (half operands and a half C, which `simdgroup_multiply_accumulate` takes) and rounds it to f16 per lane through `thread_elements()`. A multiply-accumulate with zero A and B into a half result rounds the same, but took NDSR's network twice as long.
+- **Check:** `test_dmsh_hmma.py`'s GPU runs compare every output bit for bit with the two-block reference (main's body differs in 21,461 of them). Isolated on an M5 Max, NDSR's `fa3033d05c0a41d6` takes 0.316 ms against 0.276 and `d99fbeeb53d38847` 0.446 against 0.393; their outputs change in 1.5 % and 0.8 % of halves.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md): its NDVE movie network and agl's NDSR upscaler.
 
 ### Driver-segment reads outside fragment shaders
 

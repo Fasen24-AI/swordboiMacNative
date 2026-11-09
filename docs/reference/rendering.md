@@ -1278,6 +1278,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Found on:** [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) (at the title); [Batman: Arkham Knight](../../dm/games/0100ACD0163D0000/README.md#files-and-shaders) (`stage 0 cb0`, at boot: the first command buffer draws before the game has bound any uniform buffer).
 - **Check:** a pass dump of the frame (`DM_NVN_PASSDUMP=<frame>`, frame 0 for the boot) shows the draw (`j` line) and its stage's `K` line with no `B … cb` line, and the frame's `[nvn]` call counts show whether the game called `CommandBufferBindUniformBuffer` at all.
 
+### Fragment shaders reading beyond a bound uniform range
+
+- **Symptom:** a fragment shader can read adjacent pool data through a short NVN uniform binding. Paper Mario can hang the GPU during the Peach sequence.
+- **Cause:** the NVN bind records both address and byte count. The generated Metal fragment shader previously received only the address. A GPU test with a 16-byte binding read the value at byte 2,304 in the same pool.
+- **Fix:** ordinary translated fragment constant banks carry their byte count in the Metal argument buffer. A vector entirely inside the binding uses the original load. A partial vector returns the available bytes and zeroes the rest. Reads wholly outside return zero. The original buffer remains bound for in-range reads, including data written on the GPU.
+- **Found on:** [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md#rendering). The GPU fixture is `t_fragment_uniform`.
+
 ### Compute dispatches share the copy encoder
 
 - **Symptom:** GPU time per frame doubles with many small dispatches (Age of Calamity: GPU 9 → 18 ms a frame on the Mac; the iPhone's 15 → 51 ms, 17 fps).
@@ -1285,6 +1292,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** dispatches now go into the open copy encoder, each after a barrier inside it (as texture copies are, `blit`), with the compute argument table set once per encoder (`dispatch_enc`): about 1.3 µs each.
 - **Found on:** [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md): after its first cutscene the first battle runs about 900–1,500 small dispatches a frame on the Mac (an iPhone log's call counts suggest more), each after a game barrier, at the same draws and passes; GPU 7.3 → 8.1 ms across the cutscene with the change.
 - **Note:** `DM_NVN_DISPATCH_OWN=1` (and `DM_NVN_PASSGPU`, which times each dispatch) gives each dispatch its own encoder again.
+
+### Compute dispatches ordered by the game's own barriers
+
+- **Symptom:** a frame that runs many compute dispatches back to back spends much of their GPU time waiting: each dispatch starts only when the one before it has finished, also where the game put no barrier between them.
+- **Cause:** `dispatch_enc` puts a barrier inside the shared copy encoder before every dispatch ([Compute dispatches share the copy encoder](#compute-dispatches-share-the-copy-encoder)). That is more ordering than NVN gives: it orders a dispatch after earlier work only through `nvnCommandBufferBarrier`, as the draw passes of a game with `draw_barriers game` are ordered.
+- **Fix:** the profile key `dispatch_overlap` (`DM_NVN_DISPATCH_OVERLAP` overrides it), in `dispatch_enc`. Two of the game's dispatches with nothing else between them in the copy encoder and no game barrier between them run side by side. A copy, fill or inline update between them, a dispatch of the host's own, or a game barrier keeps the barrier, and whatever follows a dispatch other than another dispatch still waits for it. `dm/gfx/tests/t_dispatch_overlap.m` checks where the barriers go.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#found-on-this-game), which runs most of its compute at the start of a frame with no barriers between the dispatches. Its `kokiri-deck` route (`scripts/bench.py`, docked, Apple M4 Pro, three runs a side, `DM_NVN_DISPATCH_OVERLAP=0` against the profile's `on`): GPU p50 15.63 → 14.76 ms, p95 16.43 → 15.66 ms, frames over budget 63 → 36, the pictures alike.
 
 ### Compute bindings prepare texture copies before the dispatch encoder
 

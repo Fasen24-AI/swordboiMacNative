@@ -700,6 +700,9 @@ static void mesh_tasks_draw(const p_draw *dw) {
         if (!mdx_find(dw->ind, dw->ind, &ind)) { mdx_run(dw, NULL); if (!mdx_find(dw->ind, dw->ind, &ind)) ind = 0; }
         if (!ind || !mtl_gpu_addr(dw->ind, 8, &mb, &mo, &ind_rec)) { RED_ONCE(154, "DrawMeshTasksIndirect record at %#llx is in no memory pool: draw skipped", (unsigned long long)dw->ind); return; }
     }
+    const char *iso_k = isolate_keys(); char k16[17] = {0}; if (ts && iso_k && strlen(ts->key) >= 16) memcpy(k16, ts->key, 16);
+    int iso = k16[0] && strstr(iso_k, k16) != NULL;
+    if (iso) { isolate_cut(); if (!(g_iso_draws++ % 20000)) MLOG("task isolation: %llu draws isolated, %llu cuts taken before them", (unsigned long long)g_iso_draws, (unsigned long long)g_iso_cuts); }
     g_mtk.on = 1; g_mtk.miss = 0; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = (uint32_t)dw->first; g_mtk.count = (uint32_t)dw->count;
     g_mtk.ind = ind; g_mtk.ind_rec = ind_rec;
     g_geo_program = raster;

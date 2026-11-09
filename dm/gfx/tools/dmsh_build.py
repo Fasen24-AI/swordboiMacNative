@@ -13,7 +13,7 @@
 # Final summary: success / failure counts and the distribution of reasons; distribution of driver segment read offsets (those outside the range the replay layer can fill are listed separately);
 # a [RED] line per shader that built but lost something (shader_regressions.report_losses), which does not change the exit status
 import atexit, bisect, inspect, os, re, sys, json, mmap, struct, hashlib, shutil, subprocess, tempfile, time, collections, threading, concurrent.futures as cf
-import dmsh_geometry, dmsh_atomic, dmsh_wide, dmsh_meshstage, dmsh_abi as abi   # abi: the driver segment layout and the binding kinds the host shares (dm/gfx/nvn/dmsh_abi.h)
+import dmsh_ubo, dmsh_geometry, dmsh_atomic, dmsh_wide, dmsh_meshstage, dmsh_abi as abi   # abi: the driver segment layout and the binding kinds the host shares (dm/gfx/nvn/dmsh_abi.h)
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # Workspace root (game files, build outputs and run artifacts are all under it)
 HOME = os.path.expanduser('~')
 dm_dir, out = sys.argv[1:3]; want = set(sys.argv[3:]); cache_root = out
@@ -100,15 +100,22 @@ HMMA_BODY = '''{
     // C and D in the call's own matrices: a slot is read only for a chain's C (cslot) and written only for its D (dslot). A call outside every chain has slot 0 in its
     // flags (no slot bits); working in acc[0..1] it overwrote the accumulator a chain held there between its two calls (Ocarina of Time's agl_ndsr_vr networks: 2,515 such
     // calls in 30 shaders, dotted rows across fog and light, GitHub issue #1537). The flags are constants at each inlined call, so the copies cost nothing
+    // Ampere adds each 8 products to the accumulator and rounds once to f16, k 0-7 then k 8-15 (N_FMA 8 in Khattak and Mikaitis's A100 model, which matches recorded
+    // A100 output in 5,000 of 5,000 cases), where simdgroup_half8x8 rounds after every product (2,420 of them). So each block runs in f32 (each product of two halves
+    // exact, the sum in order) and its result is rounded to f16 (RNE): an f16 C, the first block's result and D are the only roundings
+    // simdgroup_multiply_accumulate takes a float result from half operands and a half C. A lane's thread_elements() are the same two places in a half and a
+    // float matrix, so the rounding is two conversions a lane (a multiply-accumulate with zero A and B into a half result gives the same bits, at twice the cost
+    // of the whole network: NDSR's fa3033d05c0a41d6 0.59 ms against 0.32 on an M5 Max)
     simdgroup_half8x8 b0, b1, c0, c1;
+    simdgroup_float8x8 f0, f1;
     simdgroup_load(b0, h + 256, 16, ulong2(0, 0), true); simdgroup_load(b1, h + 256, 16, ulong2(8, 0), true);
-    if (czero) { simdgroup_multiply(c0, am[0], b0); simdgroup_multiply(c1, am[2], b0); }
-    else {
-        if (cslot) { c0 = acc[k]; c1 = acc[k + 1]; }
-        else { simdgroup_load(c0, h + 384, 8, ulong2(0, 0)); simdgroup_load(c1, h + 384, 8, ulong2(0, 8)); }
-        simdgroup_multiply_accumulate(c0, am[0], b0, c0); simdgroup_multiply_accumulate(c1, am[2], b0, c1);
-    }
-    simdgroup_multiply_accumulate(c0, am[1], b1, c0); simdgroup_multiply_accumulate(c1, am[3], b1, c1);
+    if (czero) { c0 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h); c1 = c0; }
+    else if (cslot) { c0 = acc[k]; c1 = acc[k + 1]; }
+    else { simdgroup_load(c0, h + 384, 8, ulong2(0, 0)); simdgroup_load(c1, h + 384, 8, ulong2(0, 8)); }
+    simdgroup_multiply_accumulate(f0, am[0], b0, c0); simdgroup_multiply_accumulate(f1, am[2], b0, c1);
+    for (int i = 0; i < 2; i++) { c0.thread_elements()[i] = half(f0.thread_elements()[i]); c1.thread_elements()[i] = half(f1.thread_elements()[i]); }   // the first block's rounding
+    simdgroup_multiply_accumulate(f0, am[1], b1, c0); simdgroup_multiply_accumulate(f1, am[3], b1, c1);
+    for (int i = 0; i < 2; i++) { c0.thread_elements()[i] = half(f0.thread_elements()[i]); c1.thread_elements()[i] = half(f1.thread_elements()[i]); }
     if (dslot) { acc[k] = c0; acc[k + 1] = c1; simdgroup_barrier(mem_flags::mem_threadgroup); %(d1)s = 0; return 0; }
     simdgroup_store(c0, h + 384, 8, ulong2(0, 0)); simdgroup_store(c1, h + 384, 8, ulong2(0, 8));
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -260,6 +267,64 @@ def shared_store_msl(msl):
         if u < 0: raise ValueError('dmsh_shared_store: no using namespace metal')
         u += len('using namespace metal;\n'); src = src[:u] + SHARED_ALIAS + src[u:]
     return src
+# HFMA2 on Metal. The translator writes HFMA2 as `fma(a, b, c)` on the two halves unpacked to float and packs the result with half2(float2(..)): one rounding to float, then another to half. The Orin rounds the exact
+# a * b + c once, so when the float result lands on the middle of two halves and the exact one does not (the product is exact in float, the small addend is lost in the first rounding), Metal is one half ULP off.
+# Measured on a Jetson Orin (sm_87, PTX fma.rn.f16x2, 1,048,576 random triples with 15 percent denormals and 6 percent Inf / NaN): 70 of 2,097,152 lanes
+# differ (99.9967 percent identical, e.g. -3136 * -8.125 + 0.000124693: Orin 25488, Metal 25472). dmsh_hfma returns the float rounded to odd (the neighbour of the exact value that has an odd last bit, which is the
+# float itself when the sum was exact or already odd), and the conversion to half then rounds the exact value once: round to odd costs no double rounding when the float has two more bits than the half. The error of
+# the sum comes from a TwoSum of the exact product (11 bit halves: 22 bits) and the addend, which fast math folds away (a - (b - a) is 0 for it) unless the function is compiled in safe math mode and without contraction.
+# Only an fma whose three operands are halves (unpacked, negated, or a literal a half holds) and whose every use ends in a pack to half (through the saturate and the ReLU clamp) is rewritten: an FFMA that is
+# then converted with F2FP rounds twice on the hardware as well, and HFMA2.F32 keeps its float
+HFMA_HELPERS = """// HFMA2 rounded once to half (see hfma_msl)
+static inline float dmsh_hfma(float a, float b, float c)
+{
+#pragma METAL fp math_mode(safe)
+#pragma METAL fp contract(off)
+    float p = a * b;
+    float s = fma(a, b, c);
+    float t = s - p;
+    float err = (p - (s - t)) + (c - t);
+    uint sb = as_type<uint>(s);
+    uint step = ((as_type<uint>(err) ^ sb) >> 31) != 0u ? 0xFFFFFFFFu : 1u;
+    bool odd = err != 0.0 && (sb & 1u) == 0u && (sb & 0x7F800000u) != 0x7F800000u;
+    return select(s, as_type<float>(sb + step), odd);
+}
+"""
+HFMA_DEF = re.compile(r'^([ \t]*float (_\d+) = )fma\(([^,()]+), ([^,()]+), ([^,()]+)\);$', re.M)
+HFMA_WRAP = re.compile(r'^[ \t]*float (_\d+) = (?:precise::clamp|clamp|fast::clamp|max|fmax|precise::max)\((_\d+), [-\d.]+f?(?:, [-\d.]+f?)?\);$', re.M)
+def hfma_msl(msl):
+    defs = {}
+    for m in re.finditer(r'^[ \t]*float (_\d+) = ([^;]*);$', msl, re.M): defs.setdefault(m.group(1), []).append(m.group(2))
+    def is_half(x, depth=0):   # an operand that holds a half: an unpacked lane, a literal a half holds, or the negation or absolute value of one
+        x = x.strip()
+        if depth > 6: return False
+        if re.fullmatch(r'-?\d+\.\d*(?:e[-+]?\d+)?f?|-?\d+\.?', x) is not None:
+            try: v = float(x.rstrip('f')); return struct.unpack('<e', struct.pack('<e', v))[0] == v
+            except (OverflowError, struct.error): return False
+        if x.startswith('-'): return is_half(x[1:], depth + 1)
+        if x.startswith('abs(') and x.endswith(')'): return is_half(x[4:-1], depth + 1)
+        d = defs.get(x)
+        if not d or len(d) != 1: return False
+        return re.fullmatch(r'float2\(as_type<half2>\([^;]*\)\)\.[xy]', d[0]) is not None or is_half(d[0], depth + 1)
+    def packs(v, depth=0):   # every use of v is an argument of a pack to half, or of a clamp / max whose result is
+        uses = [l for l in msl.split('\n') if re.search(r'\b%s\b' % v, l) and not re.match(r'\s*float %s = ' % v, l)]
+        if not uses or depth > 4: return False
+        for l in uses:
+            if re.search(r'half2\(float2\((?:%s, [^;]*?|[^;]*?, %s)\)\)' % (v, v), l): continue
+            w = HFMA_WRAP.match(l)
+            if w and re.search(r'\(%s,' % v, l) and packs(w.group(1), depth + 1): continue
+            return False
+        return True
+    out, last = [], 0
+    for m in HFMA_DEF.finditer(msl):
+        if len(defs.get(m.group(2), [])) == 1 and all(is_half(m.group(i)) for i in (3, 4, 5)) and packs(m.group(2)):
+            out.append(msl[last:m.start()] + m.group(1) + 'dmsh_hfma(%s, %s, %s);' % m.group(3, 4, 5)); last = m.end()
+    if not out: return msl
+    out = ''.join(out) + msl[last:]
+    u = out.find('using namespace metal;\n')
+    if u < 0: raise ValueError('hfma: no using namespace metal')
+    u += len('using namespace metal;\n')
+    return out[:u] + HFMA_HELPERS + out[u:]
 # Compute shared memory past Metal's limit: Apple's GPUs give a kernel 32 KB of threadgroup memory (maxThreadgroupMemoryLength), and Metal refuses a pipeline that declares more, while Ampere
 # gives up to 100 KB. Mario Kart World's DrivePassShaderDefault has 168 compute shaders of 48 KB (spvUnsafeArray<uint, 12288>), seven of them run on the way to the first race; refused, their
 # dispatches were skipped. Such a kernel takes its threadgroup arrays from a device buffer the host binds (abi.TG_SLOT): one slice of the arrays' total per workgroup, at the workgroup's index in
@@ -1117,7 +1182,8 @@ def reflect(key, stage, msl, res):
         pool = re.search(r'struct spvPool_%s\s*\{\s*uint n;\s*ulong seen;\s*array<(.+), \d+> e;' % re.escape(nm), msl) if ty == f'constant spvPool_{nm}*' else None
         if ty == 'sampler' and nm.endswith('Smplr' + abi.BORDER_TWIN):   # a sampler's twin (border_emu): the same sampler, its bit in the block in the order of the twins
             nm = nm[:-len(abi.BORDER_TWIN)]; e['border_bit'] = sum(1 for b in binds if 'border_bit' in b)
-        if nm == abi.BORDER_MEMBER: e.update(kind=abi.KIND_BORDER)
+        if nm.startswith(abi.CBUF_BYTES_PREFIX): e.update(kind=abi.KIND_CBUF_BYTES, reg=int(nm.rsplit('_c', 1)[1])-3)
+        elif nm == abi.BORDER_MEMBER: e.update(kind=abi.KIND_BORDER)
         elif nm in dmsh_geometry.HELPERS: e.update(kind=abi.KIND_GEOMETRY, reg=dmsh_geometry.HELPERS[nm])
         elif pool and not nm.endswith('_cb0_40000000'):   # a table of a uniform buffer's handles (pool_arrays): reg and off as an array of them, below
             ut, us = decode_ubo_tex(nm.removesuffix('Smplr'))   # pyright: ignore[reportGeneralTypeIssues]  (not None: pool_arrays made this pool only for a name it decodes)
@@ -1229,7 +1295,7 @@ RULES = []   # MSL rewrite rules attached by shader name (function, applicabilit
 # It covers what runs only when a shader misses the cache, since a hit restores the output and skips it. dmsh_side.py is in it: fs_uint and fs_dual write main0's shared body (shared_body).
 # dmsh_fetch.py is not, but for screen_varyings (raster_facts), nor are the other side libraries' modules: they are made again from the restored MSL on every build (ps_libraries;
 # test_dmsh_code_fp.py checks this list).
-CODE_FP = hashlib.sha256(source_without_rule_bodies() + b''.join(b'\0' + dmsh_chain.code_form(open(m.__file__, 'r').read()) for m in (dmsh_chain, dmsh_geometry, dmsh_atomic, dmsh_wide, dmsh_meshstage, dmsh_ampere, dmsh_side, abi) + ((ios_metal,) if IOSOUT else ()))
+CODE_FP = hashlib.sha256(source_without_rule_bodies() + b''.join(b'\0' + dmsh_chain.code_form(open(m.__file__, 'r').read()) for m in (dmsh_chain, dmsh_ubo, dmsh_geometry, dmsh_atomic, dmsh_wide, dmsh_meshstage, dmsh_ampere, dmsh_side, abi) + ((ios_metal,) if IOSOUT else ()))
                          + b'\0' + inspect.getsource(dmsh_fetch.screen_varyings).encode()
                          + b'\0abi\0' + repr(sorted(abi.VALUES.items())).encode()).hexdigest()
 TOOL_FP = tool_fingerprint().encode()
@@ -1682,12 +1748,15 @@ def finish(key, w, j, c1):
     except ValueError as e: return 'gather offsets rewrite failed', str(e)[:160], None
     try: src = hmma_msl(src)   # Ampere HMMA through simdgroup_matrix (see hmma_msl)
     except ValueError as e: return 'HMMA rewrite failed', str(e)[:160], None
+    try: src = hfma_msl(src)   # HFMA2 rounded once to half (see hfma_msl)
+    except ValueError as e: return 'HFMA2 rewrite failed', str(e)[:160], None
     try: src = shared_store_msl(src)   # shared memory byte and half-word stores as Metal byte stores (see shared_store_msl)
     except ValueError as e: return 'shared store rewrite failed', str(e)[:160], None
     try: src = pool_arrays(src)   # handles traced to no slot read the pools the replay keeps (see pool_arrays)
     except ValueError as e: return 'pool rewrite failed', str(e)[:160], None
     src = dmsh_wide.wide_loads(src)   # storage words the translator split, read whole again (see dmsh_wide.py)
     src = border_emu(src)   # border colours Metal lacks (see border_emu)
+    if j['stage'] == 'ps': src = dmsh_ubo.bounded_fragment(src)
     if j['stage'] == 'ps': src = frag_z_snap(src)[0]   # gl_FragCoord.z against a depth of its own surface (see frag_z_snap)
     open(msl, 'w').write(src)
     first, spill = [], 0
