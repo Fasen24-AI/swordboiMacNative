@@ -465,6 +465,7 @@ static void guard_sys_tick(void) {
 static uint64_t guard_used(uint64_t set) { return set; }
 static void guard_raise(int lv) { int cur = atomic_load(&g_guard_lv); while (lv > cur && !atomic_compare_exchange_weak(&g_guard_lv, &cur, lv)) {} }
 static void guard_act(uint64_t fence);
+static void alias_sweep(void);
 static void res_commit(void) {
     pthread_mutex_lock(&g_res_mu);
     if (g_res_dirty) {
@@ -2503,7 +2504,7 @@ uint64_t mtl_sub_commit(void) {
     defer_idle_commit();   // a feedback handler that drained since this submission's own commit saw it open
     g_commit_blocks = nil;
     objc_autoreleasePoolPop(g_sub_pool); g_sub_pool = NULL;
-    if (atomic_load_explicit(&g_guard_lv, memory_order_relaxed)) guard_act(fence);
+    if (atomic_load_explicit(&g_guard_lv, memory_order_relaxed)) guard_act(fence); else alias_sweep();
     return fence;
 }
 
@@ -2751,15 +2752,41 @@ enum { ALIAS_IDLE = 16 };
 static _Atomic uint64_t g_alias_taken;   // shared textures evicted when another texture took over their storage (for the memory report)
 static _Atomic uint64_t g_alias_idle;   // shared textures let go for being idle (for the memory report)
 // These entries leave the sharing table and the texture is retired (the guard's idle eviction and the storage takeover share it). Caller holds g_smu
+// A sharing entry that leaves the table takes with it the finalized serials that still resolve to its texture (g_ghost); DM_NVN_GHOST_TAKEOVER=0 turns this off. Without it the
+// texture stays resident until the ring has turned (32,768 entries since PR #1731: about 80 s in Ocarina of Time, which finalizes some 400 textures a second), although on NVN its
+// storage already belongs to the texture that took it over: render targets the game let go pile up, 3-4 GB of them when Link walks into another area. A serial purged here resolves
+// anew (ser_note), as one the ring evicts does. Views of the texture (sRGB / linear twins) are left to the ring. Measured on a 24 GB M5 walking through Castle Town, with the sweep
+// below: residency set at its peak 6.2 GB against 9.9-10.2, footprint 11.3 GB against 14.3-14.6, no frame window over 40 ms against 2-5, submit CPU unchanged (and 6.5-7.1 GB with
+// the takeover's hold of compressible entries off, which costs the app its frame rate: alias_take_over). Hookshot, NX2navi and Fritchii found the same cause in the same days: the game lays a frame's render targets out with a linear
+// allocator in one GPU-only pool, so when one changes size the others move and look like new textures. Caller holds g_smu
+static uint64_t g_ghost_purged; static nvn_hmap g_ghost; static void obj_drop(id o);   // both defined below
+static void ghost_purge(void *const *objs, uint32_t n) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_GHOST_TAKEOVER"); on = !e || atoi(e) > 0; }
+    if (!on || !n || !g_ghost.n || !g_ghost_held.n) return;
+    uint32_t held = 0; for (uint32_t j = 0; j < n; j++) { uintptr_t k = (uintptr_t)objs[j]; if (nvn_hm_get(&g_ghost_held, &k)) held++; }
+    if (!held) return;
+    uint64_t *ks = NULL; uint32_t nk = 0, cap = 0;
+    for (uint32_t i = 0; i < g_ghost.cap; i++) { void *v = g_ghost.vals[i]; if (!v) continue;
+        int hit = 0; for (uint32_t j = 0; j < n && !hit; j++) hit = v == objs[j];
+        if (!hit) continue;
+        if (nk == cap) { cap = cap ? cap * 2 : 64; ks = realloc(ks, cap * sizeof *ks); if (!ks) return; }
+        memcpy(&ks[nk++], g_ghost.keys + (size_t)i * g_ghost.klen, sizeof *ks); }
+    for (uint32_t i = 0; i < nk; i++) { id ev = hm_get_id(&g_ghost, &ks[i]); if (ev) { ghost_held_add((__bridge void *)ev, -1); obj_drop(ev); } hm_del_id(&g_ghost, &ks[i]); ser_note(ks[i]); }
+    free(ks); g_ghost_purged += nk;
+}
 static void alias_let_go(const alias_key *ks, uint32_t n) {
+    void *gone_small[16]; void **gone = n <= 16 ? gone_small : malloc(n * sizeof *gone); uint32_t ng = 0;
     for (uint32_t j = 0; j < n; j++) {
         void *old = nvn_hm_del(&g_alias, &ks[j]);
         if (!old) continue;
+        if (gone) gone[ng++] = old;
         nvn_hm_del(&g_alias_seen, &ks[j]);
         id o = CFBridgingRelease(old);
         if (g_alias_set) CFSetRemoveValue(g_alias_set, (__bridge const void *)o);
         defer_obj_release(o);
     }
+    if (gone) ghost_purge(gone, ng);
+    if (gone != gone_small) free(gone);
 }
 // Whether another entry in g_alias already overlaps nk's storage in the same pool: if so, this pool region is reused across different texture descriptions, so an initial zero-fill of a new texture here would clobber or race with the shared storage's consumers unless needed, whereas if another entry overlaps, we know it's an aliased scratch region
 static int alias_overlaps(const alias_key *nk) {
@@ -2780,7 +2807,12 @@ static void alias_take_over(const alias_key *nk) {
     nvn_texlayout L; nvn_tex_layout(&nk->d, &L);
     if (!L.size) return;
     int64_t lo = nk->off, hi = nk->off + (int64_t)L.size;
-    uint64_t comp_idle = g_dev.currentAllocatedSize < g_dev.recommendedMaxWorkingSetSize / 2 ? 1800 : ALIAS_IDLE;
+    // Compressible entries outlive a takeover for 1800 submissions while the GPU's allocation is under half of Metal's working set (PR #1731's rule; DM_NVN_ALIAS_KEEP_MB=<MB> sets the
+    // bound, 0 turns the hold off). A takeover that is skipped is not tried again: what it leaves is the idle sweep's (alias_sweep), 600 submissions after the last lookup. Without
+    // the hold an entry lasts 16 submissions past its last lookup, and a game that alternates between layouts of its render targets has them made again every frame: Ocarina of Time
+    // at full screen, while its dynamic resolution moves, 16,819 textures (30 GB of allocations) in 300 frames, a submit CPU of 17.7 ms against 7.9 and frames of 34 ms
+    static uint64_t keep = UINT64_MAX; if (keep == UINT64_MAX) { const char *e = getenv("DM_NVN_ALIAS_KEEP_MB"); keep = e ? strtoull(e, NULL, 0) << 20 : g_dev.recommendedMaxWorkingSetSize / 2; }
+    uint64_t comp_idle = g_dev.currentAllocatedSize < keep ? 1800 : ALIAS_IDLE;
     uint32_t n = 0; alias_key ks[16];
     for (uint32_t i = 0; i < g_alias.cap && n < 16; i++) {
         if (!g_alias.vals[i]) continue;
@@ -2807,6 +2839,9 @@ static void serial_del(uint64_t k) { pthread_mutex_lock(&g_smu); id old = hm_get
 enum { NGHOST = 32768 };
 static nvn_hmap g_tex_live = {.klen = 8};   // serial → the texture object it was initialized in (mtl_tex_release), under g_smu
 static nvn_hmap g_ghost = {.klen = 8}; static uint64_t g_ghost_ring[NGHOST]; static unsigned g_ghost_next; static uint64_t g_ghost_puts;
+// DM_NVN_GHOST_N=<entries> (64..NGHOST, default NGHOST): how many finalized serials keep resolving, and so keep their textures alive. Upstream's ring is 512; PR #1731 made it 32,768.
+// Ocarina of Time finalizes about 400 textures a second, so 32,768 entries hold what the game let go for some 80 s: an area left behind stays in GPU memory that long
+static unsigned ghost_cap(void) { static unsigned n; if (!n) { const char *e = getenv("DM_NVN_GHOST_N"); long v = e ? atol(e) : NGHOST; n = v < 64 ? 64 : v > NGHOST ? NGHOST : (unsigned)v; } return n; }
 void mtl_tex_init(const tex_t *t) {
     if (!t->serial) return;
     tex_t *desc = image_shape(t) ? malloc(sizeof *desc) : NULL; if (desc) *desc = *t;
@@ -2861,7 +2896,7 @@ static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external t
     if (old) count_add(m == &g_by_serial ? &g_by_serial_held : &g_ghost_held, (__bridge void *)old, -1);
     if (old) obj_drop(old);
     else if (m == &g_ghost) {
-        uint64_t *slot = &g_ghost_ring[g_ghost_next++ % NGHOST];
+        uint64_t *slot = &g_ghost_ring[g_ghost_next++ % ghost_cap()];
         if (*slot) { id ev = hm_get_id(&g_ghost, slot); if (ev) { ghost_held_add((__bridge void *)ev, -1); obj_drop(ev); } hm_del_id(&g_ghost, slot); ser_note(*slot); }   // the evicted serial resolves anew too
         *slot = k; g_ghost_puts++;
     }
@@ -6673,7 +6708,7 @@ static void treg_finish_submission(void) {
 }
 // Sharing entries nothing else holds and no lookup found for ALIAS_IDLE submissions leave the table. The GPU memory guard's: at this point, a texture that comes back empty is better than a stop.
 // What a live or finalized object resolves to stays, its sRGB / linear view's parent too. A retired ID's view of one keeps the texture alive until that ID is registered again; the IDs that read it read 0 at the next walk. Runs on the submit thread
-static unsigned alias_evict_idle(void) {
+static unsigned alias_evict_idle(uint64_t idle) {
     os_unfair_lock_lock(&g_rmu);
     pthread_mutex_lock(&g_smu);
     CFMutableSetRef held = CFSetCreateMutable(NULL, 0, NULL); nvn_hmap *hs[2] = {&g_by_serial, &g_ghost};
@@ -6682,7 +6717,7 @@ static unsigned alias_evict_idle(void) {
     uint32_t n = 0; alias_key *ks = g_alias.n ? malloc(g_alias.n * sizeof *ks) : NULL;
     for (uint32_t i = 0; ks && i < g_alias.cap; i++) { if (!g_alias.vals[i] || CFSetContainsValue(held, g_alias.vals[i])) continue;
         const void *k = g_alias.keys + (size_t)i * g_alias.klen; uint64_t seen = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, k);
-        if (!seen || g_fence + 1 - seen >= ALIAS_IDLE) memcpy(&ks[n++], k, sizeof *ks); }
+        if (!seen || g_fence + 1 - seen >= idle) memcpy(&ks[n++], k, sizeof *ks); }
     CFRelease(held);
     alias_let_go(ks, n);
     if (n) { g_ser_gen++; g_alias_idle += n; }
@@ -6710,12 +6745,25 @@ static unsigned pkg_trim(void) {
     pthread_mutex_unlock(&g_smu);
     return n;
 }
+// Every DM_NVN_ALIAS_SWEEP frames (default 120; 0 turns it off), the sharing entries nothing holds and no lookup found for DM_NVN_ALIAS_SWEEP_IDLE submissions (default 600) leave the
+// table without waiting for the memory guard, so an area left behind gives its textures back while the system still has memory to give. The guard evicts the same entries, but only once
+// kern.memorystatus_level is under twice its margin: Ocarina of Time on a 24 GB Mac was by then at 100 MB of free pages, the compressor busy (2,394 entries, 2.3 GB let go at once).
+// On the submit thread, after a submission, with no lock held
+static void alias_sweep(void) {
+    static int every = -1; static uint64_t idle, last, lines;
+    if (every < 0) { const char *e = getenv("DM_NVN_ALIAS_SWEEP"); every = e ? atoi(e) : 120; const char *i = getenv("DM_NVN_ALIAS_SWEEP_IDLE"); idle = i ? strtoull(i, NULL, 0) : 600; }
+    if (every <= 0) return;
+    uint64_t f = atomic_load(&g_cur_frame) + 1; if (last && f - last < (uint64_t)every) return;
+    last = f;
+    @autoreleasepool { unsigned n = alias_evict_idle(idle);
+        if (n) { defer_drain(); res_commit(); if (lines++ < 24) MLOG("alias sweep at frame %llu: %u idle sharing entries let go (%llu MB allocated)", (unsigned long long)f, n, (unsigned long long)(g_dev.currentAllocatedSize >> 20)); } }
+}
 // From the eviction level: what can go. Everything here leaves behind the fences of the submissions that may use it, so the sizes fall a little later
 static void guard_evict(int force) { @autoreleasepool {
     static uint64_t last; uint64_t f = atomic_load(&g_cur_frame) + 1;
     if (!force && last && f - last < GUARD_EVERY) return;
     last = f;
-    unsigned entries = alias_evict_idle(), spares = pkg_trim(), staging = up_trim();
+    unsigned entries = alias_evict_idle(ALIAS_IDLE), spares = pkg_trim(), staging = up_trim();
     defer_drain(); res_commit();
     static uint64_t lines; if (entries + spares + staging && lines++ < 16)
         MLOG("GPU memory guard: %llu MB allocated (it lets go from %llu MB): %u idle sharing entries, %u spare textures, %u staging blocks let go", (unsigned long long)(g_dev.currentAllocatedSize >> 20), (unsigned long long)(g_guard.evict >> 20), entries, spares, staging);
