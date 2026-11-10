@@ -15152,7 +15152,7 @@ static void copy_b2t(const p_copy_b2t *c, uint32_t size) {
     else
         for (int z = 0; z < nz; z++)
             enc_b_copy_buffer_texture(b, sb, mo + z * img, row, img, MTLSizeMake(c->r.width, c->r.height, 1), t, layer0 + c->r.zoffset + z, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, 0));
-    if (rb) mirror_readback(c->tex, t, level, layer0, &c->r, "buffer", 0);
+    if (rb) mirror_readback(c->tex, t, level, layer0, &c->r, "buffer", 1);
     else if (own && !is3d) gsb_mark(c->tex, t, level, layer0 + (unsigned)c->r.zoffset, (unsigned)nz, &c->r);
     if (mir) pkg_copy_absorb(c->tex, t, level, layer0 + (unsigned)c->r.zoffset, nz);   // the storage and the host texture both have the copy: no upload for it
 }
