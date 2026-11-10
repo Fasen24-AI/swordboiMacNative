@@ -2830,7 +2830,11 @@ static void alias_take_over(const alias_key *nk) {
     // the hold an entry lasts 16 submissions past its last lookup, and a game that alternates between layouts of its render targets has them made again every frame: Ocarina of Time
     // at full screen, while its dynamic resolution moves, 16,819 textures (30 GB of allocations) in 300 frames, a submit CPU of 17.7 ms against 7.9 and frames of 34 ms
     static uint64_t keep = UINT64_MAX; if (keep == UINT64_MAX) { const char *e = getenv("DM_NVN_ALIAS_KEEP_MB"); keep = e ? strtoull(e, NULL, 0) << 20 : g_dev.recommendedMaxWorkingSetSize / 2; }
-    uint64_t comp_idle = g_dev.currentAllocatedSize < keep ? 1800 : ALIAS_IDLE;
+    // Over the bound the hold shortens, it does not end: ALIAS_KEEP_SHORT submissions (about a second of Ocarina of Time's frames) still cover the layouts a game alternates between.
+    // Ending it there (ALIAS_IDLE, 16 submissions) was a cliff: a session that crossed the bound on entering an area (7,855 to 10,308 MB) made 23,100 textures in 300 frames, 77 a frame,
+    // with frames of 93 ms and a footprint of 17 GB, and the storm itself kept the allocation over the bound
+    enum { ALIAS_KEEP_SHORT = 240 };
+    uint64_t comp_idle = !keep ? ALIAS_IDLE : g_dev.currentAllocatedSize < keep ? 1800 : ALIAS_KEEP_SHORT;
     uint32_t n = 0; alias_key ks[16];
     for (uint32_t i = 0; i < g_alias.cap && n < 16; i++) {
         if (!g_alias.vals[i]) continue;
