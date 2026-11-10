@@ -6991,7 +6991,7 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
         // its view); one that held none, or is emptied, is cleared as before. A texture streamed into an ID no shader has read yet holds its stand-in until its first read (pool_stand, issue #1969).
         // DM_NVN_POOL_SEEN_KEEP=0: clear it on every change, as before
         static int keep = -1; if (keep < 0) { const char *e = getenv("DM_NVN_POOL_SEEN_KEEP"); keep = !(e && !strcmp(e, "0")); }
-        int keep_it = keep && t && rr->ok && (rr->retired || rr->view);
+        int keep_it = keep && t;   // main's 6d9edb07: the mark is the ID's, kept while the ID holds a texture (also one that still waits for the read budget); PR #2022 kept it only for a made one
         reg_bump(id_, 0); if (!keep_it) pool_seen_clear(id_);
         treg_unlink(id_); treg_drop_views(rr); treg_drop_stand(rr);
         rr->tt1 = 0; rr->reg_frame = atomic_load(&g_cur_frame);
