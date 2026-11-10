@@ -1,5 +1,7 @@
 // The GPU memory guard (nvn_mtl.m guard_*): a commit past the working set is not made while removals still are, the eviction level lets go of what nothing holds and keeps what a live object or
-// its sRGB view holds, the stop level gives the eviction a chance first, stops once with the report, and a stuck submit thread is stopped by the timer without its lock
+// its sRGB view holds, the stop level gives the eviction a chance first, stops once with the report, and a stuck submit thread is stopped by the timer without its lock. At the
+// eviction level an entry idle for less than the sweep's wait stays; at the stop level it goes. In a process of its own (argument "memory"): DM_MEMORY_GB lowers where the guard
+// begins to let go, and not where it stops the game
 #define nvn_game_fps nvn_game_fps_mtl_default
 #include "../nvn/nvn_mtl.m"
 #undef nvn_game_fps
@@ -64,6 +66,8 @@ static void eviction(void) {
     id<MTLBuffer> staging = [g_dev newBufferWithLength:1 << 20 options:MTLResourceStorageModePrivate]; res_add(staging); g_up_slot_blk[1] = staging; __weak id<MTLBuffer> w_staging = staging; staging = nil;
     uint64_t idle = g_alias_idle, gen = g_ser_gen;
     g_sub_thread = pthread_self(); atomic_store(&g_sub_thread_set, 1);
+    guard_evict(0);   // the eviction level: entries go after the sweep's wait (600 submissions), and this one has been idle for ALIAS_IDLE
+    @autoreleasepool { CHECK(g_alias_idle == idle && g_ser_gen == gen && w_dead && in_set(w_dead), "at the eviction level an entry idle for less than the sweep's wait stays"); }   // a pool of its own: a weak read can leave the texture in the autorelease pool, alive past its eviction
     guard_evict(1);
     CHECK(g_alias_idle == idle + 1 && g_ser_gen == gen + 1, "one entry left, one bump");
     settle();
@@ -100,12 +104,23 @@ static void stuck(void) {
     CHECK(stops == 1, "then the timer stops the game, with the lock held");
     pthread_mutex_unlock(&g_res_mu);
 }
+// The Memory setting: guard_init (in mtl_init) took the levels from DM_MEMORY_GB=8, as a player who plans for an 8 GB Mac
+static void memory(void) {
+    uint64_t ws = g_dev.recommendedMaxWorkingSetSize, plan = (uint64_t)(8 * 0.74 * 1024) << 20, want = plan < ws ? plan : ws;
+    CHECK(rule_ws() == want, "the rules plan for the smaller of the device's working set and the one of the memory named");
+    CHECK(g_guard.evict == want / 100 * 80, "the guard begins to let go at 80 % of what the rules plan for");
+    CHECK(g_guard.stop == ws / 100 * 95 && g_guard.wall == ws, "and stops the game where the device's own limit is, as without the setting");
+    CHECK(pool_budget() == want / 20, "textures made ahead of their first read: a twentieth of the plan");
+}
 
 int main(int argc, char **argv) { @autoreleasepool {
-    (void)argv; signal(SIGTERM, on_term);
-    setenv("DM_NVN_RES_LIMIT_MB", "0", 1);   // this test sets the levels itself
+    signal(SIGTERM, on_term);
+    int mem = argc > 1 && !strcmp(argv[1], "memory");
+    if (mem) { unsetenv("DM_NVN_RES_LIMIT_MB"); setenv("DM_MEMORY_GB", "8", 1); }
+    else setenv("DM_NVN_RES_LIMIT_MB", "0", 1);   // this test sets the levels itself
     mtl_init();
-    if (argc > 1) stuck();
+    if (mem) memory();
+    else if (argc > 1) stuck();
     else { levels(); commits(); eviction(); stop(); }
     printf("t_res_guard: %d checks, %d failed\n", checks, failed);
     return failed != 0;

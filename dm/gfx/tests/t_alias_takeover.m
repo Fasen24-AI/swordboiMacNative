@@ -1,7 +1,8 @@
 // alias_take_over (nvn_mtl.m): when a new shared texture takes over storage, an entry a live texture object still resolves to stays, and one nothing resolves to any more goes once
 // no lookup has found it for ALIAS_IDLE submissions. Whether a live object resolves to it is one lookup in g_by_serial_held, which every writer of g_by_serial keeps (serial_put,
 // serial_del, tex_put and the upgrade's in-place replacement): two serials naming one object count twice and the object stays held until both go. Last, a takeover past 1,000
-// held entries with 20,000 serials in the table, which walked the serial table for each entry before (it prints the time).
+// held entries with 20,000 serials in the table, which walked the serial table for each entry before (it prints the time). Then a compressible entry over the hold's bound
+// (DM_NVN_ALIAS_KEEP_MB=1, so any allocation is over it): a takeover keeps it for ALIAS_KEEP_SHORT submissions, not ALIAS_IDLE, and lets it go after.
 #include "../nvn/nvn_mtl.m"
 void *front_metal_layer(void) { return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
@@ -22,6 +23,7 @@ static int held(id o) { pthread_mutex_lock(&g_smu); int r = serial_table_holds((
 static void next_submission(void) { CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "submission completes"); mtl_sub_begin(); }
 
 int main(void) { @autoreleasepool {
+    setenv("DM_NVN_ALIAS_KEEP_MB", "1", 1);   // the hold's bound: 1 MB, under any allocation (read at the first takeover; the cases before the last use no compressible texture)
     mtl_init(); mtl_sub_begin();
     tex_t a = tex(91001, NVN_FORMAT_RGBA8, 64), b = tex(91002, NVN_FORMAT_R32F, 64), c = tex(91003, NVN_FORMAT_RG16F, 64);
     mtl_tex_init(&a); mtl_tex_init(&b); mtl_tex_init(&c);
@@ -68,6 +70,22 @@ int main(void) { @autoreleasepool {
         CHECK(after == before, "held entries are kept");
         CHECK(ms < 1, "the takeover asks each entry in one lookup (under 1 ms; walking the serial table for each took 4.3 ms on an M5 Max)");
         for (int i = 0; i < NS; i++) serial_del((1ull << 62) + 100 + i);
+    }
+    {   // Over the hold's bound: a compressible entry nothing holds stays through a takeover for ALIAS_KEEP_SHORT submissions, then goes
+        const int64_t off = 64 << 20;
+        tex_t p = tex(91021, NVN_FORMAT_RGBA16F, 64), q = tex(91022, NVN_FORMAT_R32F, 64), s = tex(91023, NVN_FORMAT_RG16F, 64);
+        p.off = q.off = s.off = off; p.d.flags |= NVN_TEXTURE_FLAGS_COMPRESSIBLE;
+        mtl_tex_init(&p);
+        id<MTLTexture> tp = tex_mtl(&p);
+        CHECK(tp && shared(tp), "a compressible render target is shared");
+        mtl_tex_release(&p);
+        for (int i = 0; i <= ALIAS_IDLE; i++) next_submission();
+        mtl_tex_init(&q); id<MTLTexture> tq = tex_mtl(&q);
+        CHECK(tq && shared(tp), "over the bound, a takeover past ALIAS_IDLE keeps it (the layouts a game alternates between)");
+        for (int i = 0; i < 600; i++) next_submission();
+        mtl_tex_init(&s); id<MTLTexture> ts = tex_mtl(&s);
+        CHECK(ts && !shared(tp), "and a takeover past the sweep's wait lets it go");
+        mtl_tex_release(&q); mtl_tex_release(&s);
     }
     mtl_tex_release(&b); mtl_tex_release(&c);
     next_submission(); defer_drain();

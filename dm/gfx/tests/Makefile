@@ -127,6 +127,7 @@ t_res_guard: t_res_guard.m $(MTL_T_DEP)
 check_t_res_guard: t_res_guard
 	MTL_DEBUG_LAYER=1 ./t_res_guard
 	MTL_DEBUG_LAYER=1 ./t_res_guard stuck
+	MTL_DEBUG_LAYER=1 ./t_res_guard memory
 # The game's dispatches side by side in the copy encoder where no barrier of its and nothing else lies between them (dispatch_enc, DM_NVN_DISPATCH_OVERLAP)
 t_dispatch_overlap: t_dispatch_overlap.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_overlap.m $(MTL_T_SRC) $(FW)
