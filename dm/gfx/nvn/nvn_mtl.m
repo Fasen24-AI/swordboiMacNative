@@ -16670,7 +16670,8 @@ void mtl_up_mfx_stats(uint64_t *n, uint64_t *kept) { *n = g_up_mfx_n; *kept = g_
 static int up_mfx_on(void) {
     static int v = -1;
     if (v >= 0) return v;
-    const char *e = getenv("DM_UPSCALER"); v = e && !strcmp(e, "metalfx") ? 1 : e && !strcmp(e, "off") ? 2 : 0;   // 1 MetalFX draws, 2 the network is skipped: its input drawn bilinearly into its output (no sharpening at all)
+    const char *e = getenv("DM_UPSCALER"); if (!e || !*e) e = DM_GAME_START_UPSCALE;   // unset: the profile's upscaler key
+    v = !strcmp(e, "metalfx") ? 1 : !strcmp(e, "off") ? 2 : 0;   // 1 MetalFX draws, 2 the network is skipped: its input drawn bilinearly into its output (no sharpening at all)
     if (e && *e && !v && strcmp(e, "game")) MLOG("[RED] DM_UPSCALER=%s: metalfx, off or game; keeping the game's", e);
     if (v == 1 && !(g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev])) { MLOG("upscaler: this GPU has no Metal 4 MetalFX spatial scaler; the game's own upscaler draws"); v = 0; }
     if (v) MLOG("upscaler (DM_UPSCALER): %s, the game's upscaler shaders (%d, from the shader map) are %s", v == 1 ? "metalfx" : "off", DM_GAME_UPSCALER_N,

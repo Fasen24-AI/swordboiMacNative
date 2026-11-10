@@ -331,14 +331,15 @@ void dm_fps_state_apply(void) {
     memcpy(dm_fps_state + 0x60, &fixed, sizeof fixed); memcpy(dm_fps_state + 0x64, &fsc, sizeof fsc);
     if (fixed) LOG("%s: fixed resolution: the game's resolution controller takes its disabled path%s", g_fps_mod, fsc ? " at the host's scale" : "");
     // The game's own dynamic resolution, for builds whose stubs read it (the DYNAMIC_RESOLUTION capability of a frame step stub: Ocarina of Time's level function): 1 lets it
-    // run, 0 (the default) holds full resolution. Builds without such a stub ignore the field
-    const char *dr = getenv("DM_DYNAMIC_RESOLUTION"); uint32_t dyn = dr && !strcmp(dr, "1");
+    // run, 0 holds full resolution; unset, the profile's dynamic_resolution key decides (off unless set). Builds without such a stub ignore the field
+    const char *dr = getenv("DM_DYNAMIC_RESOLUTION"); uint32_t dyn = dr ? !strcmp(dr, "1") : DM_GAME_START_DYNAMIC_RESOLUTION;
     if (dr && strcmp(dr, "0") && strcmp(dr, "1")) LOG("[RED] DM_DYNAMIC_RESOLUTION=%s: must be 0 or 1; keeping full resolution", dr);
     memcpy(dm_fps_state + 0x40, &dyn, sizeof dyn);
     // Native output, for builds whose stubs read it (the NATIVE_OUTPUT capability: Ocarina of Time v131072's window crop): DM_OUTPUT=native draws the full output size instead
-    // of the game's 80 % frame scaled up; 0 or unset keeps the game's frame. Builds without such a stub ignore the field
-    const char *no = getenv("DM_OUTPUT"); uint32_t native = no && !strcmp(no, "native");
-    if (no && strcmp(no, "0") && !native) LOG("[RED] DM_OUTPUT=%s: must be 0 or native; keeping the game's frame", no);
+    // of the game's 80 % frame scaled up; 0 keeps the game's frame; unset, the profile's output key decides (the game's frame unless set). Builds without such a stub ignore the field
+    const char *no = getenv("DM_OUTPUT"); if (!no) no = DM_GAME_START_OUTPUT;
+    uint32_t native = !strcmp(no, "native");
+    if (strcmp(no, "0") && !native) LOG("[RED] DM_OUTPUT=%s: must be 0 or native; keeping the game's frame", no);
     else if (native) LOG("%s: output native (DM_OUTPUT): the picture is the full output size", g_fps_mod);
     memcpy(dm_fps_state + 0x44, &native, sizeof native);
     // Render size, for builds whose stub reads it (the RENDER_SIZE capability: Hades II 1.0.131248's app init): DM_RENDER_SIZE=<w>x<h>, 16:9 from 1280x720 to 3840x2160, sets the
