@@ -3,7 +3,7 @@
 The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls** and **Performance**. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
 
 - [Tested defaults](#tested-defaults)
-- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Fixed resolution](#fixed-resolution), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Sharpening](#sharpening), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
+- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Fixed resolution](#fixed-resolution), [Output](#output), [Resolution](#resolution), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Sharpening](#sharpening), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff), [Press a button to join](#press-a-button-to-join)
 - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
 - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
@@ -42,6 +42,14 @@ Shown for games whose resolution controller the app can switch off (Ocarina of T
 - **When to change it:** when the picture is soft because the controller sits at its floor, and a steady size matters more than a steady 60; with [Frame rate](#frame-rate) at 30 fps the top size usually holds.
 - **Cost:** GPU time, in proportion to the pixels: the controller no longer saves the frame rate.
 - **Found by:** Lichii's "Max Resolution" patch and Hookshot's fixed resolution (the same flag of the game's engine); only the facts were taken.
+
+### Output
+
+What the game draws into the picture, for games the app can change it in (Ocarina of Time v131072): **Game**, the default, its own frame, 80 % of the size scaled up as on the console; **Native**, the full size, sharper and with more GPU time.
+
+### Resolution
+
+The size the game renders at, for games the app can resize (Hades II 1.0.131248; Ocarina of Time v131072, docked): **Game's own**, the size it renders on the Switch (Hades II 1280 × 720, Ocarina of Time 2560 × 1440, of which it draws 80 % and scales up), **1920 × 1080**, **2560 × 1440** or **3840 × 2160**. A larger size is sharper on a larger screen and takes more GPU time per frame; the HUD and text are laid out for the size.
 
 ### Console mode
 

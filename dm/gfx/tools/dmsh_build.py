@@ -114,6 +114,39 @@ def loop_guard(msl):
         out.append(l)
     return '\n'.join(out)
 
+# A texel fetch past the edge of a sampled 2D texture reads the nearest texel inside. A game can fetch there by its own arithmetic: The Legend of Zelda: Ocarina of Time's ground mist
+# (5ad65c0eefd09c7f) projects each mist sample to the screen and fetches the half-resolution scene depth at x = uv * 768, uv not clamped, on a 768-wide texture (its constant c3[18]), so a sample
+# just past the picture's edge reads past the texture, by that arithmetic on the console as well. On an M4 Max Metal returns 0 there (t_fetch_clamp with the rewrite removed, float and depth
+# textures alike), the near plane under the game's depth test: every such sample counted as hidden, and the mist had a hard straight edge at the picture's left and right margins. Switch 2 footage
+# of the area shows no edge, so its GPU returns something else there. Open: which value (the nearest texel, the far plane or another), what a Switch 1 GPU returns, and whether the nearest texel
+# is right for the other reads this reaches (seen only for this mist). Only sampled 2D textures (Ryujinx's <stage>_t_ names, declared texture2d without an access qualifier or depth2d): images
+# (<stage>_i_, also declared texture2d when only read), arrays, 3D and multisampled textures keep Metal's result, as do the names in `keep` (the caller's: the 1D integer fetches the translator reads
+# as 2D rows, where a texture buffer may be bound, fetch1d_names), a texture reached through another expression than a name or a member chain, and a read inside another read's coordinate.
+# Both searches start with a literal (the call, read back to its texture; the declarations): a pattern without one tries every position of a multi-megabyte shader (dmsh_fetch.py, _once).
+def fetch_clamp(msl, keep=()):
+    if '.read(uint2(' not in msl: return msl
+    decl = (m for p in (r'texture2d<(?:float|int|uint)>\s+(\w+)', r'depth2d<float>\s+(\w+)') for m in re.finditer(p, msl))   # literal starts, a word boundary checked by hand
+    plain = {m.group(1) for m in decl if not (m.start() and (msl[m.start() - 1].isalnum() or msl[m.start() - 1] == '_')) and re.match(r'[a-z]+_t_', m.group(1)) and m.group(1) not in keep}
+    out, at, k = [], 0, msl.find('.read(uint2(')
+    while k >= 0:
+        m = re.search(r'(?<![\w.>\])])((?:\w+\.)*(\w+))\Z', msl[max(0, k - 256):k])   # the texture: a name, or a member chain ending in it
+        if m and m.group(2) in plain and k - len(m.group(1)) >= at:
+            i, depth, comma = k + len('.read('), 0, None
+            for j in range(i, len(msl)):
+                c = msl[j]
+                if c in '([': depth += 1
+                elif c == ']' or (c == ')' and depth > 0): depth -= 1
+                elif c == ')': end = j; break
+                elif c == ',' and depth == 0 and comma is None: comma = j
+            else: raise ValueError('texel fetch: call not closed')
+            coord = msl[i:comma if comma is not None else end].strip()
+            lod = msl[comma + 1:end].strip() if comma is not None else '0'
+            t = m.group(1)
+            out += [msl[at:i], f'uint2(clamp(int2({coord}), int2(0), int2({t}.get_width(uint({lod})), {t}.get_height(uint({lod}))) - 1)), {lod}']
+            at = end
+        k = msl.find('.read(uint2(', k + 1)
+    return ''.join(out) + msl[at:]
+
 # Ampere HMMA.16816 with an f16 accumulator (agl's upscaler networks, the NDVE video networks) reaches the MSL as calls of dmsh_hmma16816_f16(lane, block, A0..A3, B0, B1, C0, C1,
 # flags, A's LDSM address, A0..A3's offsets, A's row stride, out D1) → D0, the subgroup's 256-word block of the scratch shared memory as the last argument (InstEmitAmpereTensor.AHmma,
 # TensorPass, HelperFunctionManager.GenerateHmma16816F16). The translator's body computes D lane by lane from the block; here it becomes simdgroup_matrix code over the same block:
@@ -147,15 +180,22 @@ HMMA_BODY = '''{
     // C and D in the call's own matrices: a slot is read only for a chain's C (cslot) and written only for its D (dslot). A call outside every chain has slot 0 in its
     // flags (no slot bits); working in acc[0..1] it overwrote the accumulator a chain held there between its two calls (Ocarina of Time's agl_ndsr_vr networks: 2,515 such
     // calls in 30 shaders, dotted rows across fog and light, GitHub issue #1537). The flags are constants at each inlined call, so the copies cost nothing
+    // Ampere adds each 8 products to the accumulator and rounds once to f16, k 0-7 then k 8-15 (N_FMA 8 in Khattak and Mikaitis's A100 model, which matches recorded
+    // A100 output in 5,000 of 5,000 cases), where simdgroup_half8x8 rounds after every product (2,420 of them). So each block runs in f32 (each product of two halves
+    // exact, the sum in order) and its result is rounded to f16 (RNE): an f16 C, the first block's result and D are the only roundings
+    // simdgroup_multiply_accumulate takes a float result from half operands and a half C. A lane's thread_elements() are the same two places in a half and a
+    // float matrix, so the rounding is two conversions a lane. Rounding through a multiply-accumulate with zero A and B into a half result gives the same bits but
+    // made the network twice as slow (NDSR's fa3033d05c0a41d6: 0.59 ms against 0.32 on an M5 Max). dm/gfx/msl/ndve_engine.metal's hmma() rounds the same way
     simdgroup_half8x8 b0, b1, c0, c1;
+    simdgroup_float8x8 f0, f1;
     simdgroup_load(b0, h + 256, 16, ulong2(0, 0), true); simdgroup_load(b1, h + 256, 16, ulong2(8, 0), true);
-    if (czero) { simdgroup_multiply(c0, am[0], b0); simdgroup_multiply(c1, am[2], b0); }
-    else {
-        if (cslot) { c0 = acc[k]; c1 = acc[k + 1]; }
-        else { simdgroup_load(c0, h + 384, 8, ulong2(0, 0)); simdgroup_load(c1, h + 384, 8, ulong2(0, 8)); }
-        simdgroup_multiply_accumulate(c0, am[0], b0, c0); simdgroup_multiply_accumulate(c1, am[2], b0, c1);
-    }
-    simdgroup_multiply_accumulate(c0, am[1], b1, c0); simdgroup_multiply_accumulate(c1, am[3], b1, c1);
+    if (czero) { c0 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h); c1 = c0; }
+    else if (cslot) { c0 = acc[k]; c1 = acc[k + 1]; }
+    else { simdgroup_load(c0, h + 384, 8, ulong2(0, 0)); simdgroup_load(c1, h + 384, 8, ulong2(0, 8)); }
+    simdgroup_multiply_accumulate(f0, am[0], b0, c0); simdgroup_multiply_accumulate(f1, am[2], b0, c1);
+    for (int i = 0; i < 2; i++) { c0.thread_elements()[i] = half(f0.thread_elements()[i]); c1.thread_elements()[i] = half(f1.thread_elements()[i]); }   // the first block's rounding
+    simdgroup_multiply_accumulate(f0, am[1], b1, c0); simdgroup_multiply_accumulate(f1, am[3], b1, c1);
+    for (int i = 0; i < 2; i++) { c0.thread_elements()[i] = half(f0.thread_elements()[i]); c1.thread_elements()[i] = half(f1.thread_elements()[i]); }
     if (dslot) { acc[k] = c0; acc[k + 1] = c1; simdgroup_barrier(mem_flags::mem_threadgroup); %(d1)s = 0; return 0; }
     simdgroup_store(c0, h + 384, 8, ulong2(0, 0)); simdgroup_store(c1, h + 384, 8, ulong2(0, 8));
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -368,8 +408,9 @@ def hfma_msl(msl):
 # Compute shared memory past Metal's limit: Apple's GPUs give a kernel 32 KB of threadgroup memory (maxThreadgroupMemoryLength), and Metal refuses a pipeline that declares more, while Ampere
 # gives up to 100 KB. Mario Kart World's DrivePassShaderDefault has 168 compute shaders of 48 KB (spvUnsafeArray<uint, 12288>), seven of them run on the way to the first race; refused, their
 # dispatches were skipped. Such a kernel takes its threadgroup arrays from a device buffer the host binds (abi.TG_SLOT): one slice of the arrays' total per workgroup, at the workgroup's index in
-# the dispatch modulo abi.TG_GROUPS (an indirect dispatch's count is not known on the CPU; workgroups that far apart are not on the GPU together). Its threadgroup barriers order device memory
-# too, and threadgroup atomics become device atomics. Returns the shader and the bytes per workgroup (0: unchanged)
+# the whole grid, so no two workgroups of a dispatch share one (the host sizes the buffer from the grid: nvn_mtl.m dispatch). A slice index modulo 512 shared them: Apple's GPUs start workgroups in
+# no order, and an M6 ran groups 512 apart at the same time from 1,024 groups up (shaders.md, Compute shared memory past 32 KB). Its threadgroup barriers order device memory too, and threadgroup
+# atomics become device atomics. Returns the shader and the bytes per workgroup (0: unchanged)
 TG_DECL = re.compile(r'^([ \t]*)threadgroup (spvUnsafeArray<(\w+), (\d+)>|\w+) (\w+)(?:\[(\d+)\])?;[ \t]*$', re.M)
 TG_BYTES = {'uint': 4, 'int': 4, 'float': 4, 'uint2': 8, 'int2': 8, 'float2': 8, 'uint3': 16, 'int3': 16, 'float3': 16, 'uint4': 16, 'int4': 16, 'float4': 16,
             'half': 2, 'short': 2, 'ushort': 2, 'half2': 4, 'half4': 8, 'char': 1, 'uchar': 1}
@@ -393,7 +434,7 @@ def tg_spill(msl):
     for k, (d, off) in enumerate(decls):
         out.append(msl[at:d.start()])
         t = d.group(2) + (f'[{d.group(6)}]' if d.group(6) else '')
-        if k == 0: out.append(f'{d.group(1)}ulong dm_tgbase = ulong((({gid}.z * dm_ntg.y + {gid}.y) * dm_ntg.x + {gid}.x) % {abi.TG_GROUPS}u) * {total}ul;\n')
+        if k == 0: out.append(f'{d.group(1)}ulong dm_tgbase = ((ulong({gid}.z) * dm_ntg.y + {gid}.y) * dm_ntg.x + {gid}.x) * {total}ul;\n')   # in 64 bits: past 87,381 workgroups of 48 KB the byte offset takes more than 32
         if d.group(6): out.append(f'{d.group(1)}device {d.group(2)} (&{d.group(5)})[{d.group(6)}] = *(device {d.group(2)} (*)[{d.group(6)}])(dm_tg + dm_tgbase + {off});')
         else: out.append(f'{d.group(1)}device {t}& {d.group(5)} = *(device {t}*)(dm_tg + dm_tgbase + {off});')
         at = d.end()
@@ -490,6 +531,32 @@ def border_emu(msl):
         twin = f'spvDescriptorSet0.{m.group(2)}{abi.BORDER_TWIN}'
         msl = msl[:m.start()] + f'dm_bs({msl[m.start():i]}, spvDescriptorSet0.{abi.BORDER_MEMBER}, {bit[m.group(2)]}u, spvDescriptorSet0.{m.group(1)}, {twin}, {args})' + msl[i:]
     return msl.replace('using namespace metal;\n', 'using namespace metal;\n' + BORDER_LIVE_FC + BORDER_HELPERS, 1)
+# A colour output's rgb where its alpha is exactly 0 and the rgb is not finite. NVIDIA's blender takes a zero factor times anything as 0 (Direct3D's rule: 0 × Inf = 0 × NaN = 0), so a pixel
+# shader may leave garbage in the colour of a pixel it means to add nothing to and say so with alpha 0: with SRC_ALPHA blending the target keeps its value. Apple's blender multiplies as IEEE
+# does (0 × NaN = NaN), stores the NaN, and every later pass that reads the target spreads it.
+# Ocarina of Time's half-resolution light shader 5ad65c0eefd09c7f averages hit positions over a fog layer whose density is 0 there (a positive hit count, a weight sum of 0: 1/0 × 0 = NaN; its
+# FMULs carry no .FMZ, so the translation is exact) and writes them with alpha 0 into an RGBA16F light target blended SRC_ALPHA / ONE_MINUS_SRC_ALPHA. The fog pass carried the NaN into the
+# scene and bloom turned each into a white cloud over the ferns at the camera, coming and going as they swayed across the fog volume's surface.
+# So main0, the entry a pipeline with float colour targets takes, returns a non-finite rgb as 0 where alpha is 0: a finite output is never changed, and neither are the integer entry points
+# (main0_u / main0_m: dm_body_main0, dmsh_side.shared_body), whose outputs are bits. Outside SRC_ALPHA blending the change only touches outputs that were NaN or Inf already
+BLEND_ZERO = ('static inline __attribute__((always_inline)) float4 dm_az(float4 c)   // see blend_zero\n'
+              '{\n    return c.w == 0.0f ? float4(select(c.xyz, float3(0.0f), isnan(c.xyz) || isinf(c.xyz)), c.w) : c;\n}\n')
+def blend_zero(msl):
+    """→ (msl with each `return out;` line of main0 preceded by out.<m> = dm_az(out.<m>); for its float4 colour outputs and BLEND_ZERO before main0, the number of returns guarded).
+    Unchanged (0) when main0 has no float4 colour output, is not of a shape dmsh_side.entry knows, or returns other than on a line of its own"""
+    st = re.search(r'struct main0_out\s*\{(.*?)\};', msl, re.S)
+    cols = [nm for ty, nm, at in re.findall(r'^\s*(\w+)\s+(\w+)\s*(\[\[[^\]]*\]\])?;', st.group(1), re.M) if ty == 'float4' and 'color(' in at] if st else []
+    if not cols or 'dm_az(' in msl: return msl, 0
+    try: e = dmsh_side.entry(msl, 'main0')
+    except ValueError: return msl, 0
+    if not e or e['ret'] != 'main0_out': return msl, 0
+    body = msl[e['head']:e['end']]
+    n = len(re.findall(r'\breturn out;', body))
+    guard = ' '.join(f'out.{c} = dm_az(out.{c});' for c in cols)
+    body, k = re.subn(r'^([ \t]*)return out;$', lambda m: f'{m.group(1)}{guard}\n{m.group(1)}return out;', body, flags=re.M)
+    if not k or k != n: return msl, 0
+    return msl[:e['start']] + BLEND_ZERO + msl[e['start']:e['head']] + body + msl[e['end']:], k
+
 # gl_FragCoord.z against a depth the shader read. NVIDIA stores a fragment's depth as the z its pixel shader reads, so a shader can test a fragment against a depth image of its own surface and
 # find them equal. Apple's GPU stores a value below the [[position]].z its fragment shader reads at some pixels: by up to one ulp of z plus a fraction of the depth's step across a pixel
 # (dm/gfx/tests/t_zsnap.m: 0.2% of a perspective triangle's pixels, 2% of flat ones, none above, the largest gap one ulp plus 2^-23 of fwidth(z)); writing [[position]].z as the depth would
@@ -1056,7 +1123,7 @@ def raster_facts(stage, src):
     scr = {'screen': dmsh_fetch.screen_varyings(src)}   # clip → screen varyings (dmsh_fetch.py): the vertex side of a projective sample's tile read
     body = re.search(r'\bvertex\s+\w+\s+\w+\s*\(.*?\)\s*\{(.*)\}\s*$', src, re.S)   # the main function is the last function in the file
     if not body or re.search(r'\b(if|for|while|switch|do)\b|clip_distance|ClipDistance', body.group(1)): return {'pos_attr': -1, **scr}
-    b = body.group(1)
+    b = dmsh_fetch.unguard(body.group(1))   # a bounded uniform word read bare (the host's proof reads it only from inside its binding)
     attr = {m.group(2): int(m.group(3)) for m in attributes(src)}
     var = {m.group(1): (m.group(2), m.group(3)) for m in re.finditer(r'float\s+(_\w+)\s*=\s*in\.(\w+)\.([xyzw]);', b)}
     last = {}
@@ -1085,6 +1152,11 @@ def raster_facts(stage, src):
         if fx and fy and fx[0][0] == fy[0][0] and fx[0][0] in attr and fx[0][1] == 'x' and fy[0][1] == 'y' and min(fx[1][0], fx[2][0], fy[1][0], fy[2][0]) >= 0:
             aff[str(k)] = {'attr': attr[fx[0][0]], 'sx': fx[1], 'ox': fx[2], 'sy': fy[1], 'oy': fy[2]}
     return {'pos_attr': attr[m0[0]], 'pos_w': w, 'uv_from_attr': uv, 'uv_affine': aff, **scr}
+
+def fetch1d_names(msl, res):
+    """The 2D texture names whose slot the translator reads by 1D integer fetches as 2D rows (res "fetch1d", Program.cs RecordTexelFetch1D; a texture buffer may be bound there): fetch_clamp keeps them"""
+    f1 = set(res.get('fetch1d', ()))
+    return {nm for nm in re.findall(r'\btexture2d<\w+>\s+(\w+)', msl) if (decode_tex(nm) or (None,))[0] in f1} if f1 else set()
 
 def decode_tex(name):
     """fp_t_cb{slots}_{handle} / fp_t_tcb_{handle}: texture slot, sampler slot (Ryujinx TextureHandle encoding; c[2] handle table). Handle type 3 (SeparateConstantSamplerHandle) carries a constant
@@ -1145,11 +1217,14 @@ def c2_array(name, ty):
 
 POOL_MIN = 33   # arrays at least this long are pools: Program.cs sizes Ryujinx's handle fallback by the pools, the vendored BindlessElimination keeps 32-entry slot arrays (NvnSlotArrayLength)
 
+# The test is a plain load: an atomic one, even relaxed, goes to the shared cache every time, and the reads of a pass name a few IDs, so its pixels queue on the same word.
+# A 1536x864 pass of 16 marks a pixel over 16 IDs: 2.60 ms atomic, 0.34 plain, 0.18 with no mark (Apple M6). A stale 0 costs an OR that changes nothing; a bit only goes
+# from 0 to 1 while a submission runs, as the host clears one (pool_seen_clear) only for an ID registered anew, which work committed after it reads
 POOL_MARK = """template<typename P> static inline __attribute__((always_inline)) uint dm_pool_mark(constant P* p, uint i)
 {
-    device atomic_uint* w = reinterpret_cast<device atomic_uint*>(p->seen) + (i >> 5);
+    device uint* w = reinterpret_cast<device uint*>(p->seen) + (i >> 5);
     uint b = 1u << (i & 31u);
-    if (!(atomic_load_explicit(w, memory_order_relaxed) & b)) atomic_fetch_or_explicit(w, b, memory_order_relaxed);
+    if (!(*w & b)) atomic_fetch_or_explicit(reinterpret_cast<device atomic_uint*>(w), b, memory_order_relaxed);
     return i;
 }
 
@@ -1159,7 +1234,7 @@ def pool_arrays(src):
     """Ryujinx's arrays for a texture handle it cannot trace to one slot (<stage>_<t|s>_cb0_40000000, indexed by the handle's texture / sampler ID), sized to the whole ID ranges
     (Program.cs QueryTextureArrayLengthFromPool, 2^20 and 2^12) → a pointer to a pool the replay keeps per element type (nvn_mtl.m pool_gpu): struct spvPool_<name> { uint n; ulong seen;
     array<element, 1> e; }, read as (&e[0])[min(index, n)], n being the highest ID the host filled. A read of a texture pool also sets the ID's bit in the bitmap at seen (dm_pool_mark), as which IDs a
-    shader reads is known only here: the host makes those textures instead of all of them. The word is read first: a bit is set once, so nearly every read costs a load, not an atomic. The struct declares one element: Metal's argument encoder walks every element
+    shader reads is known only here: the host makes those textures instead of all of them. The word is read first, with a plain load: a bit is set once, so nearly every read costs a load, not an atomic. The struct declares one element: Metal's argument encoder walks every element
     of a declared array (AGX IndirectArgumentLayoutGen2::parseArray), and for 2^20 textures that took 57 ms and 66 MB per encoder (9.7 GB in Mario Party Superstars' prewarm);
     the elements are 8-byte resource IDs, so the pointer reaches the rest (checked on the GPU). Mario Party Superstars' characters read their light textures' handles from a
     storage buffer (6,370 pixel shaders). The argument IDs are then renumbered in member order, a pointer taking one and any other array its length, as the host lays the buffer out.
@@ -1237,7 +1312,9 @@ def reflect(key, stage, msl, res):
         elif nm == 'support_buffer': e.update(kind=abi.KIND_SUPPORT)
         elif re.fullmatch(r'[a-z]+_c(\d+)', nm):
             n = int(re.fullmatch(r'[a-z]+_c(\d+)', nm).group(1))
-            e.update(kind=abi.KIND_CBUF, reg=n - 3) if 3 <= n <= 16 else e.update(kind=abi.KIND_C1 if n == 1 else abi.KIND_DRVCB, bank=n)
+            if 3 <= n <= 16: e.update(kind=abi.KIND_CBUF, reg=n - 3)
+            elif n == abi.CBSIZE_BANK: e.update(kind=abi.KIND_CBSIZE)   # the uniform slots' bound sizes, which the translator's bounded reads compare with
+            else: e.update(kind=abi.KIND_C1 if n == 1 else abi.KIND_DRVCB, bank=n)
         elif re.fullmatch(r'[a-z]+_s(\d+)', nm):
             e.update(kind=abi.KIND_SBUF, index=int(re.fullmatch(r'[a-z]+_s(\d+)', nm).group(1)))
         elif decode_ubo_tex(nm[:-5] if nm.endswith('Smplr') else nm):   # bindless: the handle is in a uniform buffer (reg = uniform slot, off = byte offset)
@@ -1552,6 +1629,7 @@ def int_outputs(src, body, cols):
     constants, shifts and ORs). So each write is followed back through the locals: a value computed by an integer operation or a small integer constant counts as integer, the bits of a computed
     float as float; zero, larger constants (the bits of a float constant) and words copied from a uniform or an input say nothing. A denormal float literal is a small integer constant SPIRV-Cross
     printed through the output's type. → the outputs with integers and no float bits, or, when none is that clean (a register reused by two branches), the outputs with integers"""
+    body = dmsh_fetch.unguard(body)   # a bounded uniform word is a word copied from a uniform
     types = {v: t for t, v in re.findall(r'^\s*(u?int\d?|float\d?|bool)\s+(_\d+)\b', body, re.M)}
     defs = collections.defaultdict(list)
     for v, e in re.findall(r'^\s*(?:(?:u?int\d?|float\d?|bool)\s+)?(_\d+)\s*=\s*([^;]+);', body, re.M): defs[v].append(e.strip())
@@ -1716,9 +1794,10 @@ def geometry_finish(key, w, j, c1):
         dmsh_geometry.flatten_sets(spv)
         r = subprocess.run([SPIRV_CROSS, *dmsh_atomic.cross_args(XC, spv), spv], capture_output=True, text=True)
         if r.returncode: return 'geometry MSL failed', r.stderr.strip()[:160], None
-        plain = dmsh_geometry.topology_pointer(pool_arrays(loop_guard(precise(dmsh_atomic.check_msl(r.stdout)))))
-        src = dmsh_geometry.capture_input(plain)
         res = json.load(open(os.path.join(w, k + '.res.json')))
+        cross = loop_guard(precise(dmsh_atomic.check_msl(r.stdout)))   # no loop can run forever (see loop_guard)
+        plain = dmsh_geometry.topology_pointer(pool_arrays(fetch_clamp(cross, fetch1d_names(cross, res))))   # as finish: see precise, fetch_clamp
+        src = dmsh_geometry.capture_input(plain)
         refl = {'key': key + '_bg' + str(t), 'route': 'B', 'chain': CHAIN, 'dm_ctl': key,
                 'source': f'{loc[key][0]}#{loc[key][1]}', 'pc_paired': pc_of[key], 'stage': 'gs',
                 'entry': 'main0', 'msl_entry_kind': 'kernel', 'threadgroup_size': [32, 1, 1],
@@ -1790,6 +1869,9 @@ def finish(key, w, j, c1):
     src = precise(src)   # min / max / clamp with Maxwell's NaN results (see precise)
     src = mul_extended(src)   # scalar extended products without the optnone wrapper (see mul_extended)
     src = float_add_msl(src)   # a float add's compare-and-swap loop as one native atomic add (see float_add_msl)
+    res = json.load(open(os.path.join(w, key + '.res.json')))
+    try: src = fetch_clamp(src, fetch1d_names(src, res))   # texel fetches past the edge of a sampled 2D texture (see fetch_clamp)
+    except ValueError as e: return 'texel fetch clamp failed', str(e)[:160], None
     try: src = gather_offsets(src)   # four gathers instead of a wrapper's loop over their offsets (see gather_offsets)
     except ValueError as e: return 'gather offsets rewrite failed', str(e)[:160], None
     src = loop_guard(src)   # no loop can run forever (see loop_guard)
@@ -1822,7 +1904,6 @@ def finish(key, w, j, c1):
         src, pad = vs_pad(key, src)
         if pad: open(msl, 'w').write(src)
     lay = None; discard = False
-    res = json.load(open(os.path.join(w, key + '.res.json')))
     if j['stage'] == 'vs':   # the two depth-convention entry points (see vs_depth); the analysis below uses the source with only main0
         capture = dmsh_geometry.capture(src)
         src, full = vs_depth(src)
@@ -1838,6 +1919,9 @@ def finish(key, w, j, c1):
     shared = dmsh_side.shared_body(src) if fu or fd else None   # they call main0's body; fs_uint and fs_dual give none for a main0 whose shape it does not know
     if shared: plain = src; open(msl, 'w').write(shared + (fu or '') + (fd or ''))
     else: fu = fd = None
+    if j['stage'] == 'ps':   # main0 returns a non-finite rgb at alpha 0 as 0, as NVIDIA's blender takes a zero factor (see blend_zero); after the entry points that share main0's body
+        bz, nbz = blend_zero(open(msl).read())
+        if nbz: open(msl, 'w').write(bz)
     try: binds = reflect(key, mesh['kind'] if mesh else j['stage'], src, res)   # before the compile: a pixel shader's readable-tile version needs its texture slots (ps_libraries)
     except ValueError as e: return 'reflection failed', str(e)[:160], None
     side, lost = {}, []
@@ -1876,7 +1960,16 @@ def finish(key, w, j, c1):
 keys = build_keys(want, loc, PAIRS)
 if want: want = set(keys)   # dependency outputs are cleaned too, so a failed pixel build cannot leave old MSL for padding
 NJ = int(os.environ.get('J', '8'))
-BATCH = 4 * NJ   # shaders translated and finished together: the next batch is translated while this one is finished, and a shader's working files go when it is (fin).
+# A build runs as several processes. Each shader needs about 40 ms of this file's own Python (the rewrites, its outputs, the cache), which one process runs one shader at a time
+# whatever J is: on Ocarina of Time's cold build on an 18-core Mac that Python was busy the whole build while the cores were half idle. PROCS copies of this run (workers, DMSH_SHARD:
+# their index, their count, the phase and the file of their results) each build a share of a phase's shaders with their own threads and stage the outputs in the same cache under this
+# folder's name, as one process would; this run then reads their results and writes the library as before. DMSH_PROCS sets the count (1: no workers)
+SHARD = os.environ.get('DMSH_SHARD')
+PROCS = 1 if SHARD else max(1, int(os.environ.get('DMSH_PROCS') or -(-NJ // 3)))   # one process per 3 of J: 6 for J=18 measured best (193 s → 101 s on a 1,714-shader sample)
+SHARD_OUT = ''
+if SHARD:
+    _si, _sn, _sph, SHARD_OUT = SHARD.split('/', 3)
+    keys = [k for k in keys if (k in PAIRS) == (_sph == '2')][int(_si)::int(_sn)]
 # Minecraft Dungeons II, 15,826 shaders: at most 3,279 files under the build folder with batches of 256 removed whole, 68,230 before batches (Octopath Traveler 0's stopped build)
 # A full build starts from no shader outputs, a partial one from none of the keys it builds, so what a run leaves is what it built: every output is restored from the cache anyway.
 # The chain version is the same whatever the profile's tables, so a key that left the map, a shader that no longer builds or a variant no longer made would keep an old library.
@@ -1888,6 +1981,9 @@ STAMP_BEFORE = shader_lib.read_stamp(out).get('inputs')
 OLD_IMAGE = {}
 for _label, _d in (('mac', out), ('ios', IOSOUT)):
     if not _d: continue
+    if SHARD:   # the build that started this worker cleared the folder
+        if want and os.path.isfile(shader_lib.image_of(_d)): OLD_IMAGE[_label] = romfs.Path(shader_lib.image_of(_d))
+        continue
     if not want:
         shutil.rmtree(_d, ignore_errors=True); shader_lib.remove_image(_d)
     elif os.path.isfile(shader_lib.image_of(_d)): OLD_IMAGE[_label] = romfs.Path(shader_lib.image_of(_d))
@@ -1896,7 +1992,7 @@ for _label, _d in (('mac', out), ('ios', IOSOUT)):
         _m = OUT_KEY.match(_n)
         if _m and _m.group(1) in want: os.unlink(os.path.join(_d, _n))
     if STAMP_BEFORE != INPUTS and os.path.exists(os.path.join(_d, dmsh_chain.STAMP)): os.unlink(os.path.join(_d, dmsh_chain.STAMP))
-STORE.delete_prefix(STAGE + '/')   # what a stopped build of this folder staged
+if not SHARD: STORE.delete_prefix(STAGE + '/')   # what a stopped build of this folder staged
 
 def sweep_work(root):
     """The working folders (dmsh_*) a build left that is no longer running: each holds the process ID of its build (pid), one from before that is taken after a day.
@@ -1918,7 +2014,7 @@ w = tempfile.mkdtemp(prefix='dmsh_', dir=_work)
 with open(os.path.join(w, 'pid'), 'w') as _f: _f.write(str(os.getpid()))
 MTL = dmsh_mtlcache.Cache(STORE, {'mac': ('macosx', MAC_RECORD, mac_compile), **({'ios': ('iphoneos', ios_metal.RECORD, ios_metal.compile)} if IOSOUT else {})}, w)
 # first take the libraries earlier chain versions left on disk: the b-*/ and b-*.img beside the output (iOS: the folder of the same name) and the roots DMSH_PREFILL lists
-for _spec in [cache_root + ('=' + os.path.dirname(IOSOUT) if IOSOUT else '')] + [x for x in os.environ.get('DMSH_PREFILL', '').split(os.pathsep) if x]:
+for _spec in [] if SHARD else [cache_root + ('=' + os.path.dirname(IOSOUT) if IOSOUT else '')] + [x for x in os.environ.get('DMSH_PREFILL', '').split(os.pathsep) if x]:
     _mac, _, _ios = _spec.partition('=')
     for _b in sorted(os.listdir(_mac)) if os.path.isdir(_mac) else []:
         if _b.startswith('b-') and os.path.realpath(shader_lib.folder_of(os.path.join(_mac, _b))) != os.path.realpath(out):
@@ -1961,7 +2057,7 @@ def plain_digest(k):   # a paired pixel shader's key, also when it is not built 
     return shader_key(k, *rec_of(k)) if k in loc else 'missing'
 for key in keys:
     if PAIRS.get(key): digests[key] = pair_keyed(digests[key], [plain_digest(p) for p in sorted(PAIRS[key])])
-for i, key in enumerate(keys):
+for i, key in enumerate(keys if PROCS == 1 else ()):   # with workers, each looks up its own share
     name = loc[key][0]
     rule_fps[key] = hashlib.sha256(shader_rule_source(name) + ','.join(sorted(PAIRS.get(key, ()))).encode()).hexdigest()   # the vertex shader must be rebuilt when its pairs change (vs_pad)
     hit, cache_reasons[key] = cache_lookup(key, digests[key], rule_fps[key], CODE_FP)
@@ -1973,17 +2069,6 @@ def xlate_errors(r):
     for ln in r.stderr.splitlines():
         m = re.match(r'\[RED\] (\w+): (.*)', ln)
         if m: xerr[m.group(1)] = m.group(2)[:160]
-def translate(batch):
-    """A batch's misses translated into a working folder of its own (removed once the batch is finished) → that folder"""
-    wb = tempfile.mkdtemp(prefix='batch_', dir=w)
-    miss = [k for k in batch if k not in cache_hits]
-    for k in miss: jobs[k], c1s[k] = job_for(k, loc[k][0], rec_of(k)[1], wb)
-    def xl(ch):
-        jp = os.path.join(wb, f'job_{abs(hash(ch[0]))}.json'); json.dump([jobs[k] for k in ch], open(jp, 'w'))
-        return subprocess.run([XLATE, jp, wb], capture_output=True, text=True)
-    with cf.ThreadPoolExecutor(NJ) as ex:
-        for r in ex.map(xl, [c for c in (miss[i::NJ] for i in range(NJ)) if c]): xlate_errors(r)
-    return wb
 def restored(key, wb):
     """A cache hit's outputs back on disk while it is finished. When another build pruned them since the look (cache_lookup), the shader is translated now, in the batch's folder: False"""
     if restore_cache(key, digests[key]): return True
@@ -2012,17 +2097,90 @@ def fin(key, wb):
                 if e.name.startswith((key, 'job1_' + key)) and e.is_file(): os.unlink(e.path)
         with _prog['lock']: DONE['n'] += 1; n = DONE['n']
         progress('compiling', n, len(keys), cached=len(cache_hits), misses=NMISS)
-# Two phases: paired vertex shaders read their pixel shaders' MSL (vs_pad), so they go last, in batches of their own. The next batch is translated while this one is finished
-batches = [b[i:i + BATCH] for b in ([k for k in keys if k not in PAIRS], [k for k in keys if k in PAIRS]) for i in range(0, len(b), BATCH)]
+# Two phases: paired vertex shaders read their pixel shaders' MSL (vs_pad), so they go last, after every other shader is finished. Within a phase nothing waits for a batch:
+# the misses are translated in chunks of CHUNK, largest record first, and each shader is finished as soon as its own chunk is translated. Batches finished together used to
+# hold every worker until the batch's slowest shader was done (Ocarina of Time's full build left the CPU about half idle). A chunk's working folder goes when its last shader
+# is finished, and at most WINDOW chunks are translated but not yet finished, which bounds the files under the build folder as the batches did
+def translate_chunk(ch):
+    """A chunk of misses translated by one translator run into a working folder of its own (removed once its last shader is finished) → that folder"""
+    wb = tempfile.mkdtemp(prefix='chunk_', dir=w)
+    for k in ch: jobs[k], c1s[k] = job_for(k, loc[k][0], rec_of(k)[1], wb)
+    jp = os.path.join(wb, 'job.json'); json.dump([jobs[k] for k in ch], open(jp, 'w'))
+    xlate_errors(subprocess.run([XLATE, jp, wb], capture_output=True, text=True))
+    return wb
+CHUNK = int(os.environ.get('DMSH_CHUNK', '8'))
+WINDOW = 2 * NJ
+order = {k: (k in PAIRS, i) for i, k in enumerate(keys)}   # results in the order the phases run, as the batches gave them
+def run_phase(phase):
+    hits = [k for k in phase if k in cache_hits]
+    miss = sorted((k for k in phase if k not in cache_hits), key=lambda k: -len(rec_of(k)[1]))
+    chunks = [miss[i:i + CHUNK] for i in range(0, len(miss), CHUNK)]
+    out_res, left, lock, room = [], {}, threading.Lock(), threading.Semaphore(WINDOW)
+    def done_one(wb):
+        with lock:
+            left[wb] -= 1; last = not left[wb]
+        if last: shutil.rmtree(wb, ignore_errors=True); room.release()
+    with cf.ThreadPoolExecutor(NJ) as tx, cf.ThreadPoolExecutor(NJ) as ex:
+        fins, errs, chunk_of = [], [], {}
+        def fin_in(k, wb):
+            try: return fin(k, wb)
+            finally: done_one(wb)
+        def start(wb, ks):   # a folder's shaders, handed to the finishing workers
+            with lock:
+                left[wb] = len(ks); fins.extend(ex.submit(fin_in, k, wb) for k in ks)
+        def translated(f):   # in the translating worker, once its chunk is translated
+            try: start(f.result(), chunk_of[f])
+            except BaseException as e: errs.append(e); room.release()
+        if hits:
+            room.acquire(); start(tempfile.mkdtemp(prefix='hits_', dir=w), hits)
+        for ch in chunks:
+            room.acquire()   # released when a chunk's last shader is finished
+            if errs: break
+            f = tx.submit(translate_chunk, ch)
+            with lock: chunk_of[f] = ch
+            f.add_done_callback(translated)   # after chunk_of has it: a chunk translated already runs its callback here
+        tx.shutdown(wait=True)
+        if errs: raise errs[0]
+        with lock: todo = list(fins)
+        out_res = [f.result() for f in todo]
+    return out_res
+STAT_SETS = {'pre': PRE_STATS, 'vin': VIN_STATS, 'pull': PULL_STATS, 'side': SIDE_STATS, 'bf': BF_STATS}
+def run_procs():
+    """The phases as PROCS workers each → the results of every shader, with the workers' counts added to this run's"""
+    out_res = []
+    for ph in ('1', '2'):
+        n = min(PROCS, sum(1 for k in keys if (k in PAIRS) == (ph == '2')))
+        if not n: continue
+        base, procs = len(out_res), []
+        for i in range(n):
+            rj = os.path.join(w, f'worker_{ph}_{i}.json')
+            env = dict(os.environ, DMSH_SHARD=f'{i}/{n}/{ph}/{rj}', J=str(-(-3 * NJ // (2 * n))), **({'DMSH_PROGRESS': rj + '.progress'} if PROGRESS else {}))
+            procs.append((subprocess.Popen(sys.orig_argv, env=env), rj))
+        while any(p.poll() is None for p, _ in procs):   # the workers' progress as one
+            done = 0
+            for _, rj in procs:
+                try:
+                    with open(rj + '.progress') as f: done += json.load(f).get('done', 0)
+                except (OSError, ValueError): pass
+            progress('compiling', base + done, len(keys)); time.sleep(0.5)
+        for p, rj in procs:
+            if p.returncode: sys.exit(f'[RED] shader build worker {rj} stopped ({p.returncode}); its messages are above')
+            with open(rj) as f: r = json.load(f)
+            out_res += [tuple(x) for x in r['res']]
+            for name, c in r['stats'].items(): STAT_SETS[name].update(c)
+            for what, n_ in r['mtl']: MTL.count(tuple(what) if isinstance(what, list) else what, n_)
+    return out_res
 res = []
-with cf.ThreadPoolExecutor(1) as tx, cf.ThreadPoolExecutor(NJ) as ex:
-    nxt = tx.submit(translate, batches[0]) if batches else None
-    for i, batch in enumerate(batches):
-        assert nxt is not None
-        wb = nxt.result()
-        nxt = tx.submit(translate, batches[i + 1]) if i + 1 < len(batches) else None
-        res += list(ex.map(lambda k, wb=wb: fin(k, wb), batch))
-        shutil.rmtree(wb, ignore_errors=True)
+if PROCS > 1: res = run_procs()
+else:
+    for phase in ([k for k in keys if k not in PAIRS], [k for k in keys if k in PAIRS]): res += run_phase(phase)
+res.sort(key=lambda r: order[r[0]])
+if SHARD:   # a worker: its results for the run that started it, which writes the library
+    with open(SHARD_OUT + '.tmp', 'w') as f:
+        json.dump({'res': res, 'stats': {k: dict(v) for k, v in STAT_SETS.items()}, 'mtl': [[list(k) if isinstance(k, tuple) else k, n] for k, n in MTL.stats.items()]}, f, default=list)
+    os.replace(SHARD_OUT + '.tmp', SHARD_OUT)
+    shutil.rmtree(w, ignore_errors=True)
+    sys.exit(0)
 # Passthrough geometry as mesh shaders (dmsh_mesh.py): <vertex key>_<geometry key>_m3 for each pair in the profile's geo_mesh.tsv whose two libraries exist; the host
 # draws a lean triangle-list geometry draw with it when its pair has one, and through the compute path otherwise (nvn_geometry.inc geo_mesh_draw)
 MESH_STATS = collections.Counter()
