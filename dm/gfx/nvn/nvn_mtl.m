@@ -11680,7 +11680,11 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
         } else if (b->kind == NVN_RB_CBSIZE) {   // the uniform slots' bound sizes (DMSH_CBSIZE_BANK), which the translator's reads compare with: a read past its slot's size gives 0, as on Maxwell
             id<MTLBuffer> db; size_t doff = arena_alloc(16 * ((DMSH_CBSIZE_SLOTS + 3) / 4), &db); uint32_t *d = (uint32_t *)(g_cur_arena->cpu + doff);
             memset(d, 0, 16 * ((DMSH_CBSIZE_SLOTS + 3) / 4));   // a slot with nothing bound reads the zero bank (above) and gets 0 here too
-            for (int r = 0; r < DMSH_CBSIZE_SLOTS; r++) { const p_bind_buf *u = &S.ubo[nvn_stage][r]; if (u->addr) { d[r] = u->size < 65536 ? (uint32_t)u->size : 65536; ub_short(sh, nvn_stage, r, u->size); } }
+            // A Switch 2 game (dm_sdk_ounce) gets no such bound: every bound slot 64 KB, as before 26062f9e. The Switch 2 does not seem to stop a read at the size the game binds: with the
+            // bound, Ocarina of Time read zeros past its bindings and the vertices of its horses, of Link's slingshot and of the ReDeads stretched to the origin or flickered (GitHub issue
+            // #2218; PR #2219, whose change this is in the form the bound has in this tree: the size table alone, no zero padding)
+            int unbounded = dm_sdk_ounce(); { static int once; if (unbounded && !once++) MLOG("uniform reads are not bounded by the binding's size (a Switch 2 game)"); }
+            for (int r = 0; r < DMSH_CBSIZE_SLOTS; r++) { const p_bind_buf *u = &S.ubo[nvn_stage][r]; if (u->addr) { d[r] = u->size < 65536 && !unbounded ? (uint32_t)u->size : 65536; ub_short(sh, nvn_stage, r, u->size); } }
             slots[aid] = g_cur_arena->gpu + doff; USE(db, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_PUSH) {   // NVN2 push constants (c[24]): the stage group's current block
             id<MTLBuffer> db; size_t doff = arena_alloc(DMSH_PUSH_SIZE, &db);
