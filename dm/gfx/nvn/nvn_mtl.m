@@ -426,8 +426,9 @@ static void res_check(id r, const char *what, int reg) {
              t ? [NSString stringWithFormat:@" format %lu %lux%lu type %lu usage %#lx", (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.textureType, (unsigned long)t.usage].UTF8String : ""); }
 }
 // The memory the host's rules plan for: Metal's working set for this device, or less when the player says so (the launcher's Memory, DM_MEMORY_GB=<GB>: the working set of a device
-// with that much memory, taken as 0.74 of it, which is what a 24 GB Mac reports). The rules that read it: how long a takeover holds compressible sharing entries (alias_take_over),
-// where the memory guard begins to let go (guard_init), how many textures are made ahead of their first read (pool_budget). Where the guard stops the game stays the device's own
+// with that much memory, taken as 0.74 of it, which is what a 24 GB Mac reports). The rules that read it: where the memory guard begins to let go (guard_init), and how many textures
+// are made ahead of their first read (pool_budget). Not the takeover's hold (alias_take_over): with its bound at half of a 16 GB plan, Ocarina of Time at full screen (7-9 GB) would
+// sit over it for good, the regime that made its render targets again every frame. Where the guard stops the game stays the device's own
 // limit: a player who leaves room for other apps is not asking for the game to end sooner. A value at or over the device's own changes nothing
 static uint64_t rule_ws(void) {
     static uint64_t v; if (v) return v;
@@ -2845,11 +2846,12 @@ static void alias_take_over(const alias_key *nk) {
     // bound, 0 turns the hold off). A takeover that is skipped is not tried again: what it leaves is the idle sweep's (alias_sweep), 600 submissions after the last lookup. Without
     // the hold an entry lasts 16 submissions past its last lookup, and a game that alternates between layouts of its render targets has them made again every frame: Ocarina of Time
     // at full screen, while its dynamic resolution moves, 16,819 textures (30 GB of allocations) in 300 frames, a submit CPU of 17.7 ms against 7.9 and frames of 34 ms
-    static uint64_t keep = UINT64_MAX; if (keep == UINT64_MAX) { const char *e = getenv("DM_NVN_ALIAS_KEEP_MB"); keep = e ? strtoull(e, NULL, 0) << 20 : rule_ws() / 2; }
-    // Over the bound the hold shortens, it does not end: ALIAS_KEEP_SHORT submissions (about a second of Ocarina of Time's frames) still cover the layouts a game alternates between.
+    static uint64_t keep = UINT64_MAX; if (keep == UINT64_MAX) { const char *e = getenv("DM_NVN_ALIAS_KEEP_MB"); keep = e ? strtoull(e, NULL, 0) << 20 : g_dev.recommendedMaxWorkingSetSize / 2; }   // the device's: planning for less (rule_ws) put Ocarina of Time over it all the time
+    // Over the bound the hold shortens to the idle sweep's own wait (alias_sweep, 600 submissions: 16-21 frames of Ocarina of Time, which makes 28-37 a frame), so a takeover is never
+    // stricter than the sweep. It still covers the layouts a game alternates between: the dynamic resolution holds a level at least 8 frames before it moves (the game's note).
     // Ending it there (ALIAS_IDLE, 16 submissions) was a cliff: a session that crossed the bound on entering an area (7,855 to 10,308 MB) made 23,100 textures in 300 frames, 77 a frame,
     // with frames of 93 ms and a footprint of 17 GB, and the storm itself kept the allocation over the bound
-    enum { ALIAS_KEEP_SHORT = 240 };
+    enum { ALIAS_KEEP_SHORT = 600 };
     uint64_t comp_idle = !keep ? ALIAS_IDLE : g_dev.currentAllocatedSize < keep ? 1800 : ALIAS_KEEP_SHORT;
     uint32_t n = 0; alias_key ks[16];
     for (uint32_t i = 0; i < g_alias.cap && n < 16; i++) {
@@ -6802,7 +6804,9 @@ static void guard_evict(int force) { @autoreleasepool {
     static uint64_t last; uint64_t f = atomic_load(&g_cur_frame) + 1;
     if (!force && last && f - last < GUARD_EVERY) return;
     last = f;
-    unsigned entries = alias_evict_idle(ALIAS_IDLE), spares = pkg_trim(), staging = up_trim();
+    // At the eviction level the sharing entries go after the idle sweep's wait (600 submissions), not ALIAS_IDLE's 16: what a game uses every few frames (the layouts of its dynamic
+    // resolution) stays, and with the player's Memory setting the eviction level can sit where a game runs. At the stop level (force) all that is idle goes, as before
+    unsigned entries = alias_evict_idle(force ? ALIAS_IDLE : 600), spares = pkg_trim(), staging = up_trim();
     defer_drain(); res_commit();
     static uint64_t lines; if (entries + spares + staging && lines++ < 16)
         MLOG("GPU memory guard: %llu MB allocated (it lets go from %llu MB): %u idle sharing entries, %u spare textures, %u staging blocks let go", (unsigned long long)(g_dev.currentAllocatedSize >> 20), (unsigned long long)(g_guard.evict >> 20), entries, spares, staging);

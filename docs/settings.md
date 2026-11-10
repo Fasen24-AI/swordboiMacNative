@@ -235,7 +235,7 @@ flowchart LR
 
 ### Memory
 
-Shown for games drawn through NVN. How much of the device's memory the game plans for. **Automatic**, the default, plans for all the device has. A number of GB (8, 12, 16, 18, 24, 32) plans for a device of that size: the host then lets go sooner of the textures a game has stopped using and makes fewer ahead of their first use, which leaves room for other apps and can make an area change cost a little more. A value at or above the device's own memory changes nothing, and the setting does not move the point where the host ends a game that is about to run the device out of memory. `DM_MEMORY_GB` takes `auto` or any number of GB.
+Shown for games drawn through NVN. How much of the device's memory the game plans for. **Automatic**, the default, plans for all the device has. A number of GB (8, 12, 16, 18, 24, 32) plans for a device of that size: the host's memory guard then begins to let go of the textures a game has stopped using at a lower level, and fewer are made ahead of their first use, which leaves room for other apps and can make an area change cost a little more. A value at or above the device's own memory changes nothing, and the setting does not move the point where the host ends a game that is about to run the device out of memory. `DM_MEMORY_GB` takes `auto` or any number of GB.
 
 ### Performance HUD
 
