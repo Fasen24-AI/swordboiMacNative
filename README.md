@@ -8,13 +8,25 @@ It is not an emulator: the game's own code runs directly on the Apple chip, with
 
 ## This fork: swordboiMacNative
 
-This is [nxnative](https://github.com/seedds/nxnative) with one game in mind, The Legend of Zelda: Ocarina of Time (Switch 2, `0400486024DEC000` v131072) as a Mac app, built and played on an Apple silicon Mac. It follows upstream `main` closely and carries, on top of it:
+This is [nxnative](https://github.com/seedds/nxnative) with one game in mind, The Legend of Zelda: Ocarina of Time (Switch 2, `0400486024DEC000` v131072) as a Mac app, built and played on an Apple silicon Mac. What is here is source code. There is no app to download and nothing from the game is in this repository, as upstream: you build the app yourself, from your own dump.
 
-- upstream pull requests that were still open when we needed them, applied with a three-way merge; each commit names the PRs it applies and their authors, whose work it is;
-- (until 9 Nov) a pipeline-archive fix of ours against the recompaction at every start, since replaced by upstream's compaction by size tier and archive indexes (#1879, #1880), and the start takes seconds;
+**Building it.** The command is upstream's, with one variable in front of it:
+
+```
+DM_APP_GAME_MODE=1 python3 scripts/build_ipa_from_nsp.py <your .nup> --platform mac-app --work-dir <work> -o "Zelda Ocarina of Time.app"
+```
+
+With `DM_APP_GAME_MODE=1` the app asks macOS for Game Mode, and its launcher hands its own process to the game (`DM_LAUNCH_EXEC`) instead of starting the game as a child and waiting, so Game Mode applies to the game itself. This is the app we play: on our Mac Game Mode turns on with it. Without the variable the same command makes upstream's default, an app that does not ask for Game Mode. The build takes about an hour on an M5 and needs about 80 GB of free disk for its work folder and the app.
+
+**What it carries.** It follows upstream `main` closely (this branch sits on upstream `b54968e7`, 9 Nov 2026) and has, on top of it:
+
+- upstream pull requests that were still open when we needed them, applied with a three-way merge; each commit names the PRs it applies and their authors, whose work it is. Upstream has since merged its own versions of several of them, and the next update of this branch takes those instead. One of them, #2116, is not reviewed upstream yet: it keeps an event the game signals from ending the command buffer, which this game does 21 times a frame;
+- the Game Mode build above;
 - a fixed render resolution (`DM_FIXED_RESOLUTION`, `DM_FIXED_SCALE`), a Metal HUD menu item (Window > Metal HUD), the Pro Controller's gyro zero learned at rest, and `DM_NVN_COND_CONSERVATIVE` as an A/B switch for the occlusion conditions.
 
-The build is upstream's: `python3 scripts/build_ipa_from_nsp.py <your .nup> --platform mac-app --work-dir <work> -o "Zelda Ocarina of Time.app"`, with your own dump. Nothing from the game is in this repository, as upstream. Bugs in what this fork adds go in this fork's issues; everything else belongs to [upstream](https://github.com/seedds/nxnative/issues). The game's note is [dm/games/0400486024DEC000/README.md](dm/games/0400486024DEC000/README.md).
+**Where it stands** (10 Nov 2026, MacBook Pro M5, 24 GB): 60 fps in Hyrule Castle Town in handheld mode with dynamic resolution, about 13 ms of GPU a frame at full screen. One known limit: when the game moves to another area the Mac can run out of free memory for some seconds (the GPU's wired memory peaks near 12 GB) and the frame rate falls to about 20 fps until the textures of the area left behind are let go. That is what we are working on.
+
+Bugs in what this fork adds go in this fork's issues; everything else belongs to [upstream](https://github.com/seedds/nxnative/issues). The game's note is [dm/games/0400486024DEC000/README.md](dm/games/0400486024DEC000/README.md).
 
 ## Games
 
