@@ -233,6 +233,10 @@ flowchart LR
 - **Off:** the game keeps aiming at 60; a late frame is shown one refresh later and the next one goes on as usual, so heavy scenes look less even but stay closer to 60 on average.
 - **When to change it:** turn it off if the game often falls to 30 fps although it is only slightly late.
 
+### Memory
+
+Shown for games drawn through NVN. How much of the device's memory the game plans for. **Automatic**, the default, plans for all the device has. A number of GB (8, 12, 16, 18, 24, 32) plans for a device of that size: the host then lets go sooner of the textures a game has stopped using and makes fewer ahead of their first use, which leaves room for other apps and can make an area change cost a little more. A value at or above the device's own memory changes nothing, and the setting does not move the point where the host ends a game that is about to run the device out of memory. `DM_MEMORY_GB` takes `auto` or any number of GB.
+
 ### Performance HUD
 
 Apple's performance overlay over the game: frame rate, frame and GPU times, memory. Useful to see what a setting changes; leave it off for play.
@@ -308,6 +312,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Pipeline prebuild | `DM_PSO_PREBUILD` | `1`, `0` |
 | Encode thread | `DM_NVN_ENC_THREAD` | `1`, `0` |
 | Hold frames when late | `DM_FPS_HOLD` | `on`, `off` |
+| Memory | `DM_MEMORY_GB` | `auto`, `8`, `12`, `16`, `18`, `24`, `32` |
 | Performance HUD | `DM_METAL_HUD` | `1`, `0` |
 
 `DM_LAUNCHER=0` skips the settings screen; the choices you saved there still apply. `DM_SAVED_CHOICES=0` starts with the tested defaults and keeps your saved choices for later. How the settings are listed for each game: [dm/games/settings.tsv](../dm/games/settings.tsv).

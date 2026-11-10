@@ -425,6 +425,22 @@ static void res_check(id r, const char *what, int reg) {
         MLOG("[RED] missing residency #%d: %s slot %d %s %p (parent chain %d deep) allocated %lu B storage mode %lu%s", nbad, what, reg, is_tex ? "texture" : "buffer", (__bridge void *)a, hops, (unsigned long)a.allocatedSize, (unsigned long)a.storageMode,
              t ? [NSString stringWithFormat:@" format %lu %lux%lu type %lu usage %#lx", (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.textureType, (unsigned long)t.usage].UTF8String : ""); }
 }
+// The memory the host's rules plan for: Metal's working set for this device, or less when the player says so (the launcher's Memory, DM_MEMORY_GB=<GB>: the working set of a device
+// with that much memory, taken as 0.74 of it, which is what a 24 GB Mac reports). The rules that read it: how long a takeover holds compressible sharing entries (alias_take_over),
+// where the memory guard begins to let go (guard_init), how many textures are made ahead of their first read (pool_budget). Where the guard stops the game stays the device's own
+// limit: a player who leaves room for other apps is not asking for the game to end sooner. A value at or over the device's own changes nothing
+static uint64_t rule_ws(void) {
+    static uint64_t v; if (v) return v;
+    uint64_t ws = g_dev.recommendedMaxWorkingSetSize; const char *e = getenv("DM_MEMORY_GB");
+    if (e && *e && strcmp(e, "auto")) {
+        double gb = atof(e);
+        if (!(gb >= 4 && gb <= 512)) MLOG("[RED] DM_MEMORY_GB=%s: auto, or a number of GB from 4 to 512; planning for this device's own memory", e);
+        else { uint64_t d = (uint64_t)(gb * 0.74 * 1024) << 20;
+            if (d < ws) { MLOG("memory: planning for a device with %g GB (DM_MEMORY_GB): a working set of %llu MB instead of this device's %llu MB", gb, (unsigned long long)(d >> 20), (unsigned long long)(ws >> 20)); ws = d; }
+            else MLOG("memory: DM_MEMORY_GB=%s is not under this device's own (working set %llu MB): nothing changes", e, (unsigned long long)(ws >> 20)); }
+    }
+    return v = ws;
+}
 // GPU memory guard. GPU memory is wired, and the driver refuses to wire past Metal's working set (recommendedMaxWorkingSetSize: IOGPUScheduler freeToWireMemory fails there). The submit thread
 // then waits in the kernel, where nothing can kill the process: GitHub issue #1326 ended with a Mac frozen until the power button, PR #1319's 8 GB Mac with WindowServer's watchdog. So every commit
 // of the residency set looks first, by the set's own allocatedSize, which counts what has been committed. From about 80% of the working set the submit thread lets go of what can go (guard_evict); from about 95%, if that was not enough, the game stops: a [RED] line says
@@ -709,7 +725,7 @@ static void guard_tick(void) {
 static void guard_init(void) {
     const char *e = getenv("DM_NVN_RES_LIMIT_MB"); uint64_t ws = g_dev.recommendedMaxWorkingSetSize, lim = e ? strtoull(e, NULL, 0) << 20 : 0;
     if ((e && !lim) || !ws || !g_res) return;
-    g_guard.wall = MAX(ws, lim); g_guard.stop = lim ? lim : ws / 100 * 95; g_guard.evict = g_guard.stop / 95 * 80;
+    g_guard.wall = MAX(ws, lim); g_guard.stop = lim ? lim : ws / 100 * 95; g_guard.evict = lim ? g_guard.stop / 95 * 80 : rule_ws() / 100 * 80;   // letting go begins by what the player plans for (rule_ws), stopping by the device
 #if TARGET_OS_IPHONE
     if (!lim) g_guard.stop = g_guard.wall = UINT64_MAX;
 #endif
@@ -2829,7 +2845,7 @@ static void alias_take_over(const alias_key *nk) {
     // bound, 0 turns the hold off). A takeover that is skipped is not tried again: what it leaves is the idle sweep's (alias_sweep), 600 submissions after the last lookup. Without
     // the hold an entry lasts 16 submissions past its last lookup, and a game that alternates between layouts of its render targets has them made again every frame: Ocarina of Time
     // at full screen, while its dynamic resolution moves, 16,819 textures (30 GB of allocations) in 300 frames, a submit CPU of 17.7 ms against 7.9 and frames of 34 ms
-    static uint64_t keep = UINT64_MAX; if (keep == UINT64_MAX) { const char *e = getenv("DM_NVN_ALIAS_KEEP_MB"); keep = e ? strtoull(e, NULL, 0) << 20 : g_dev.recommendedMaxWorkingSetSize / 2; }
+    static uint64_t keep = UINT64_MAX; if (keep == UINT64_MAX) { const char *e = getenv("DM_NVN_ALIAS_KEEP_MB"); keep = e ? strtoull(e, NULL, 0) << 20 : rule_ws() / 2; }
     // Over the bound the hold shortens, it does not end: ALIAS_KEEP_SHORT submissions (about a second of Ocarina of Time's frames) still cover the layouts a game alternates between.
     // Ending it there (ALIAS_IDLE, 16 submissions) was a cliff: a session that crossed the bound on entering an area (7,855 to 10,308 MB) made 23,100 textures in 300 frames, 77 a frame,
     // with frames of 93 ms and a footprint of 17 GB, and the storm itself kept the allocation over the bound
@@ -10529,7 +10545,7 @@ enum { POOL_FRAME_BYTES = 32u << 20, POOL_REQ_BYTES = 128u << 20, POOL_SUB_MS = 
 static uint64_t g_walk_frame = ~0ull, g_walk_spent, g_walk_sub = ~0ull; static double g_walk_ms; static int g_walk_over;
 static uint64_t pool_tex_size(const tex_t *t) { return t->L.size ? t->L.size : 1; }
 static int pool_size_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
-static uint64_t pool_budget(void) { return g_dev.recommendedMaxWorkingSetSize / 20; }
+static uint64_t pool_budget(void) { return rule_ws() / 20; }
 static uint64_t g_walk_req;
 // A render target no pass has written holds nothing to read, and a pass makes its texture when it renders. Made for a read, one that only registers next frame's target took three times the
 // textures and 17 GB allocated on Ocarina of Time: the game re-registers its IDs with transient targets, whose IDs a shader read as the previous texture
