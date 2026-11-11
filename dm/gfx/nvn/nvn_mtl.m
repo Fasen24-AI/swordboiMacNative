@@ -2686,6 +2686,15 @@ static void count_add(nvn_hmap *m, const void *o, int d) {
 static void held_add(const void *o, int d) { count_add(&g_by_serial_held, o, d); }
 static void ghost_held_add(const void *o, int d) { count_add(&g_ghost_held, o, d); }
 static nvn_hmap g_alias_seen = {.klen = sizeof(alias_key)};   // key → g_fence + 1 at its last lookup or creation (alias_take_over spares entries looked up lately)
+// Diagnostic only: frame + 1 of the last recorded GPU write to an existing sharing entry.
+// Keeping this separate from g_alias_seen avoids mistaking a descriptor lookup for a write.
+static nvn_hmap g_alias_written = {.klen = sizeof(alias_key)};
+static int rt_breakdown_on(void) {
+    static int on; static dispatch_once_t once;
+    dispatch_once(&once, ^{ const char *e = getenv("DM_NVN_TEX_BREAKDOWN"); on = e && atoi(e) > 0; });
+    return on;
+}
+
 // Live GPU-only image descriptions, including those not used yet. A dynamic-resolution family declares its largest image before any particular resolution is used.
 // Keeping only descriptions here lets its first allocation cover that family exactly, without allocating every resolution or rounding to a power of two.
 static nvn_hmap g_image_desc = {.klen = 8};   // serial → malloc'ed tex_t, under g_smu
@@ -2758,6 +2767,7 @@ void mtl_alias_drop_pool(const void *pool) {
         void *old = nvn_hm_del(&g_alias, &ks[j]);
         if (!old) continue;
         nvn_hm_del(&g_alias_seen, &ks[j]);
+        nvn_hm_del(&g_alias_written, &ks[j]);
         id o = CFBridgingRelease(old);
         if (g_alias_set) CFSetRemoveValue(g_alias_set, (__bridge const void *)o);
         defer_obj_release(o);
@@ -2816,6 +2826,7 @@ static void alias_let_go(const alias_key *ks, uint32_t n) {
         if (!old) continue;
         if (gone) gone[ng++] = old;
         nvn_hm_del(&g_alias_seen, &ks[j]);
+        nvn_hm_del(&g_alias_written, &ks[j]);
         id o = CFBridgingRelease(old);
         if (g_alias_set) CFSetRemoveValue(g_alias_set, (__bridge const void *)o);
         defer_obj_release(o);
@@ -4348,6 +4359,12 @@ static void gws_set(uintptr_t lo, uintptr_t hi) {   // [lo, hi) becomes one span
     atomic_store(&g_gws_new, 1);
 }
 void mtl_tex_gpu_written(const tex_t *t) {
+    if (rt_breakdown_on() && t && t->pool && (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL))) {
+        alias_key k = tex_alias_key(t);
+        pthread_mutex_lock(&g_smu);
+        if (nvn_hm_get(&g_alias, &k)) nvn_hm_put(&g_alias_written, &k, (void *)(uintptr_t)(atomic_load(&g_cur_frame) + 1));
+        pthread_mutex_unlock(&g_smu);
+    }
     if (!t || !t->mem || !t->L.size || !t->pool || (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL))) {
         return;
     }
@@ -16385,7 +16402,33 @@ void dm_gfx_poolstat(void) {
 }
 // The Mac's DM_CTL "texstat" (hle_hid.c): the host textures by kind and, for those made from guest memory (NvPkg: they can be made again from it), by the frames since their last use
 static double ps_span(const uint64_t *a, int n) { uint64_t lo = ~0ull, hi = 0; for (int i = 0; i < n; i++) if (a[i]) { lo = MIN(lo, a[i]); hi = MAX(hi, a[i]); } return hi >= lo && hi ? (double)(hi - lo) : 0; }   // address span of a group's storage starts
+// Raw snapshots let the offline report union guest intervals per pool/format/sample count,
+// and charge shared heaps once. The existing shape report sums texture sizes instead.
+static void rt_breakdown(void) {
+    if (!rt_breakdown_on()) return;
+    pthread_mutex_lock(&g_smu);
+    uint64_t frame = atomic_load(&g_cur_frame);
+    MLOG("[rtbreakdown] begin=1 frame=%llu", (unsigned long long)frame);
+    for (uint32_t i = 0; i < g_alias.cap; i++) if (g_alias.vals[i]) {
+        alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
+        const pool_t *p = (const pool_t *)(uintptr_t)k.pool;
+        if (!p || !(p->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL))) continue;
+        id<MTLTexture> t = (__bridge id)g_alias.vals[i];
+        if (!(t.usage & MTLTextureUsageRenderTarget)) continue;
+        if (t.parentTexture) t = t.parentTexture;
+        nvn_texlayout L; nvn_tex_layout(&k.d, &L);
+        NvImageHeap *owner = objc_getAssociatedObject(t, &g_image_heap_owner_key);
+        MLOG("[rtbreakdown] pool=%llu flags=%u off=%llu guest=%llu format=%lu samples=%lu texture=%llu bytes=%llu heap=%llu heap_bytes=%llu family=%d written=%llu",
+             (unsigned long long)k.pool, p->flags, (unsigned long long)k.off, (unsigned long long)L.size,
+             (unsigned long)t.pixelFormat, (unsigned long)t.sampleCount, (unsigned long long)(uintptr_t)(__bridge void *)t,
+             (unsigned long long)t.allocatedSize, (unsigned long long)(uintptr_t)(__bridge void *)t.heap, (unsigned long long)t.heap.size,
+             owner && !owner->pool_heap, (unsigned long long)(uintptr_t)nvn_hm_get(&g_alias_written, &k));
+    }
+    MLOG("[rtbreakdown] end=1 frame=%llu", (unsigned long long)frame);
+    pthread_mutex_unlock(&g_smu);
+}
 void dm_gfx_texstat(void) {
+    rt_breakdown();
     uint64_t now = atomic_load(&g_cur_frame), pk_n[4] = {0}, pk_b[4] = {0}, spare_b = 0, other_n = 0, other_b = 0, rt_b = 0, rt_n = 0;
     static uint64_t gk[256], gn[256], gb[256]; int ng = 0;   // render targets grouped by width, height, format, layers
     static uint64_t gd[256][64]; static int gdn[256]; memset(gdn, 0, sizeof gdn); static uint64_t glive[256]; memset(glive, 0, sizeof glive);   // distinct guest storage addresses per group (up to 64)
