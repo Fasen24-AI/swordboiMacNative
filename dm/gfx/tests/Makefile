@@ -639,3 +639,10 @@ t_rt_breakdown: t_rt_breakdown.m $(MTL_T_DEP)
 check_t_rt_breakdown: t_rt_breakdown
 	./t_rt_breakdown
 	./t_rt_breakdown off
+
+t_rt_lossy: t_rt_lossy.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_rt_lossy.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_rt_lossy
+check_t_rt_lossy: t_rt_lossy
+	MTL_DEBUG_LAYER=1 ./t_rt_lossy
+	MTL_DEBUG_LAYER=1 ./t_rt_lossy off

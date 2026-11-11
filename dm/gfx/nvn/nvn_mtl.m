@@ -3188,6 +3188,23 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     if (d.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) d.usage |= MTLTextureUsagePixelFormatView;
     return d;
 }
+// Metal asserts on unsupported lossy formats rather than returning nil. Keep the
+// whitelist to formats measured on Apple8+ hardware, and apply it only after the
+// family/pool paths: their shared bytes may require uncompressed storage.
+static void rt_lossy_apply(MTLTextureDescriptor *d) {
+    static int on; static dispatch_once_t once;
+    dispatch_once(&once, ^{ const char *e = getenv("DM_NVN_RT_LOSSY"); on = e && atoi(e) > 0; });
+    if (!on || ![g_dev supportsFamily:MTLGPUFamilyApple8] || d.storageMode != MTLStorageModePrivate || !d.allowGPUOptimizedContents
+        || !(d.usage & MTLTextureUsageRenderTarget) || (d.usage & (MTLTextureUsageShaderWrite | MTLTextureUsageShaderAtomic | MTLTextureUsagePixelFormatView))
+        || d.textureType == MTLTextureType1D || d.textureType == MTLTextureType1DArray || d.textureType == MTLTextureTypeTextureBuffer) return;
+    switch (d.pixelFormat) {
+        case MTLPixelFormatR8Unorm: case MTLPixelFormatR32Float: case MTLPixelFormatRG16Float:
+        case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatBGRA8Unorm:
+        case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRGBA16Float:
+            d.compressionType = MTLTextureCompressionTypeLossy; break;
+        default: break;
+    }
+}
 // In-place upgrade: when the original texture was not created with PixelFormatView (off by default, to keep Apple GPU lossless compression) but a different-format view is needed, create a new one with the original spec + PixelFormatView, copy over every slice × level, and replace the registration.
 // Count: across the 4 screens character select / camp / wilderness / combat, 17473 textures needed a different-format view 0 times, so this is a fallback and does not rely on predicting which textures need it
 // The same upgrade adds render-target usage for a whole-level clear (clear_tex) of a texture made without it: Monster Hunter Rise clears a 32x80 packaged one
@@ -4933,7 +4950,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct, int treg_retired) {
         } else {
             mt = image_texture(t, d);
             if (!mt) mt = pool_heap_texture(t, d);   // the pool's own heap first (#1453); what it leaves out may take a recycled heap (rh_texture)
-            if (!mt) { mt = rh_texture(t, d); if (!mt) mt = [g_dev newTextureWithDescriptor:d];
+            if (!mt) { rt_lossy_apply(d); mt = rh_texture(t, d); if (!mt) mt = [g_dev newTextureWithDescriptor:d];
                 if (mt) { res_add(mt); if (!tex_init_fill(t, mt)) tex_zero_fill(mt); } }
         }
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
