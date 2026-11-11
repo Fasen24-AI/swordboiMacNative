@@ -33,6 +33,17 @@ With `DM_APP_GAME_MODE=1` the app asks macOS for Game Mode, and its launcher han
 
 **Evening of 10 Nov.** Five changes on top of the version above. Three fix pictures: Switch 2 uniform reads are no longer cut at the size the game binds (streaks from the horses and the slingshot, PR #2219), an indirect dispatch no longer shares an encoder with the work that writes its counts (holes in the flower bushes of Hyrule Castle's court, PR #2226), and a texture ID keeps its read mark when the game streams another texture into it (black frames on the castle town wall, upstream's 6d9edb07); they ran in a short walk with no slow frame. Two are about memory. A long session (28 minutes) crossed the point where the host stopped holding the render targets the dynamic resolution alternates between, and from there remade them every frame, at 10 fps with the memory climbing to 17 GB until a restart; the hold now shortens there instead of ending. And a **Memory** setting (Performance, `DM_MEMORY_GB`) tells the host how much of the Mac's memory to plan for, so its memory guard begins to let go sooner. Measured the next night on the M5 (the app at full screen with Game Mode, 150 s of our walk, one run each): with the hold's bound forced low, so the run starts past it, the host before these changes remade 40,331 textures and had two 300-frame windows over 17.5 ms, this one 21,135 and none; with Memory at 16 or 12 GB, none over 17.5 ms either (at 12 GB the guard let go of a few dozen textures at a time). The setting does not lower the footprint much in a run this short (12.2-12.4 GB). Not measured yet: a session as long as the one that found the problem. If you are on the version before this push and a long session falls to 10 fps after an area change, `DM_NVN_ALIAS_KEEP_MB=16000` avoids it.
 
+**11 Nov.** Three changes from upstream, two of them already in upstream `main`:
+- a CPU write to a host page that two pools share is no longer missed while a pool buffer is made (`1e69c180`; a tester no longer saw Goron City's ground strobe);
+- the host builds at `-O2` (`c4ffb9df`);
+- texture views are cached by the Metal texture they are made of (PR #2260 by roandegraaf: a Hyrule Field view at 52-53 → 56-57 fps on an M4 Pro).
+
+Two diagnostics come with them, both off by default:
+- `DM_NVN_TEX_BREAKDOWN` logs the render targets' Metal memory against the guest storage they stand for;
+- `DM_NVN_RT_LOSSY` compresses render targets with loss: 0.7 GB less memory on our walk. Its picture has not been compared yet, so leave it off.
+
+On our walk, on a quiet M5, this version runs as the one before: no 300-frame window over 17.5 ms, 13.1 ms of GPU a frame, 12.5 GB resident. Still open: the terrain sometimes shows the wrong surface until the game reloads it, which we are tracing, and memory that keeps growing in sessions of an hour or more (upstream PR #2344 has the cause, not in this version yet).
+
 Bugs in what this fork adds go in this fork's issues; everything else belongs to [upstream](https://github.com/seedds/nxnative/issues). The game's note is [dm/games/0400486024DEC000/README.md](dm/games/0400486024DEC000/README.md).
 
 ## Games
