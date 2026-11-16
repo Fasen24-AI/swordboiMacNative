@@ -20,7 +20,9 @@ DM_RENDER_SCALE	range	0.5:1.0:0.05	1.0	fixups:RENDER_SCALE	Game	Render scale		le
 DM_FIXED_RESOLUTION	toggle	-	0	fixups:FIXED_RESOLUTION	Game	Fixed resolution	The 3D always at the game's top size (or the scale below): sharper, and the frame rate may drop instead.
 DM_FIXED_SCALE	range	0.5:1.0:0.05	1.0	fixups:FIXED_RESOLUTION	Game	Fixed resolution scale		needs=DM_FIXED_RESOLUTION=1
 DM_OUTPUT	choice	0=Game (80 % frame scaled up),native=Native (full size)	DM_GAME_START_OUTPUT	fixups:NATIVE_OUTPUT	Game	Output	What the game draws into the picture: its own frame, 80 % of the size scaled up as on the console, or the full size, sharper and with more GPU time	level=basic
-DM_RENDER_SIZE	choice	0=Game's own (as on the Switch),1920x1080=1920 × 1080,2560x1440=2560 × 1440,3840x2160=3840 × 2160	0	fixups:RENDER_SIZE	Game	Resolution	Higher sizes take more GPU time per frame	level=basic
+DM_RENDER_SIZE	choice	0=Game's own (as on the Switch),1920x1080=1920 × 1080,2560x1440=2560 × 1440,3840x2160=3840 × 2160,2560x1080=2560 × 1080 (21:9 ultrawide)?fixups:ULTRAWIDE,3440x1440=3440 × 1440 (21:9 ultrawide)?fixups:ULTRAWIDE	0	fixups:RENDER_SIZE	Game	Resolution	Higher sizes take more GPU time per frame	level=basic
+DM_UW_HUD_EDGES	toggle	-	1	fixups:ULTRAWIDE	Game	HUD at the screen's edges	On a 21:9 picture: the hearts at the left edge and the minimap at the right one. Off keeps the whole HUD in the centre 16:9	level=basic
+DM_UW_MOVIE_FILL	toggle	-	1	fixups:ULTRAWIDE	Game	Videos fill the screen	On a 21:9 picture the pre-rendered videos (title screen, menus' background, cutscenes) fill the width, their top and bottom cut. Off keeps them in the centre 16:9 with black sides	level=basic
 DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console mode		level=basic
 DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling	Uses more GPU time and can increase heat.
 DM_UPSCALER	choice	game=Game's own,metalfx=MetalFX,off=Skipped	DM_GAME_START_UPSCALE	DM_GAME_UPSCALER_N!=0	Game	Game's upscaler
