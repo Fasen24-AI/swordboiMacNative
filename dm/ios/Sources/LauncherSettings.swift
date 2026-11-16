@@ -32,7 +32,11 @@ struct Setting: Decodable, Identifiable {
     }
     enum CodingKeys: String, CodingKey { case env, kind, label, note, def = "default", section, needs, level, base, options, min, max, step, on, off }
 }
-struct SettingsFile: Decodable { let settings: [Setting] }
+struct SettingsFile: Decodable { let settings: [Setting]; let ui: [String: String]? }   // ui: the window's own strings in the language settings.py was asked for (DM_SETTINGS_LANG)
+
+/// The launcher's own strings, translated when launcher.json carries them (settings.py with DM_SETTINGS_LANG); English otherwise
+var launcherUI: [String: String] = [:]
+func L(_ s: String) -> String { launcherUI[s] ?? s }
 
 final class LauncherModel: ObservableObject {
     let settings: [Setting]
