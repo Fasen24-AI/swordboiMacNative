@@ -363,6 +363,12 @@ void dm_ctl_peek(uint64_t a, int n) {
         LOG("DM_CTL: peek %#llx: %g %g %g %g (%08x %08x %08x %08x)", (unsigned long long)(a + 4 * (uint64_t)i), f[0], f[1], f[2], f[3], w[0], w[1], w[2], w[3]);
     }
 }
+// "poke <guest address> <hex u32>": one word written into guest memory (a test switch in a state page)
+void dm_ctl_poke(uint64_t a, uint32_t v) {
+    uint32_t old; if (!rd(a, &old, 4)) { LOG("DM_CTL: poke %#llx: not readable", (unsigned long long)a); return; }
+    uint32_t *p = (uint32_t *)(uintptr_t)a; dm_guest_write_prepare(p, 4); *p = v;
+    LOG("DM_CTL: poke %#llx: %08x → %08x", (unsigned long long)a, old, v);
+}
 // "memdump <guest address> <bytes> <path>": guest memory to a file, read safely (stops at the first unreadable page)
 void dm_ctl_memdump(uint64_t a, uint64_t n, const char *path) {
     FILE *f = fopen(path, "wb"); if (!f) { LOG("[RED] DM_CTL: memdump: cannot open %s", path); return; }

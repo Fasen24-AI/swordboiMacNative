@@ -48,7 +48,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | `build` → `game` | screen shape: the sizes, the view, the layouts' projection and their edge widgets (DM_SCREEN_ASPECT) | rendering | blocked: the stubs have no function-matched form yet | judgement | 1 | [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) | the output size is the host's, but where the game takes its sizes, its cameras and its layouts are this build's code |
 | `build` → `game` | 60 fps intervals and dynamic-resolution constants | frame rate | kept: 1.0.3 (v131072) is the newest update of both releases and likely their last: a function match would serve no other build; the rewriter would also need matched rules that write fixups and declare capabilities, a new mechanism (2026-11-09) | checked: both releases' mains, where the host's rows for them were found; the global main's sites mapped into ASTRAL CHAIN and Bayonetta 1-3 (2026-11-09) | 2 | [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](../../dm/games/010056B015FE8000/README.md); [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](../../dm/games/0100B8E016F76000/README.md) | the game's own constants; the Asian release's function is the global one's 0x13c0 further on, so one function-matched rule could serve both releases. No PlatinumGames sibling shares the code: none of its sites has an exact match in ASTRAL CHAIN or Bayonetta 1-3 (nso_fnmap, 2026-11-09) |
 | `build` → `game` | NieR's frame interval and dynamic-resolution floor at fixed addresses | frame rate | kept: 1.0.3 (v131072) is the newest update of both releases and likely their last: a function match would serve no other build; the rewriter would also need matched rules that write fixups and declare capabilities, a new mechanism (2026-11-09) | checked: both releases' mains, where these rows were found; the global main's sites mapped into ASTRAL CHAIN and Bayonetta 1-3 (2026-11-09) | 2 | [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](../../dm/games/010056B015FE8000/README.md); [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](../../dm/games/0100B8E016F76000/README.md) | the game's own display object; the Asian release's function is the global one's 0x13c0 further on, so the rewriter's function match could give the host both releases' addresses. No PlatinumGames sibling shares the code: none of its sites has an exact match in ASTRAL CHAIN or Bayonetta 1-3 (nso_fnmap, 2026-11-09) |
-| `game` → `host` | one vertex shader's visibility counter (VertexCounterLowering) | shaders | kept: one shader in one game, already handled; a general lowering is a chain change (every game's shaders rebuilt) for no measured gain: revisit when a vertex shader with subgroup operations fails in another game | checked: the shader-build logs of the 51 game builds on the game drive: no shader failed to translate or compile, none mentions a subgroup operation (2026-11-09) | — | [Program.cs:261](../../dm/gfx/tools/dmsh_xlate/Program.cs#L261) | a general lowering of subgroup ballots in vertex shaders (subgroups of one invocation: ballots, votes, lane ids and counts, refusing shuffles that exchange data between lanes) would cover any shader that counts that way |
+| `game` → `host` | one vertex shader's visibility counter (VertexCounterLowering) | shaders | kept: one shader in one game, already handled; a general lowering is a chain change (every game's shaders rebuilt) for no measured gain: revisit when a vertex shader with subgroup operations fails in another game | checked: the shader-build logs of the 51 game builds on the game drive: no shader failed to translate or compile, none mentions a subgroup operation (2026-11-09) | — | [Program.cs:259](../../dm/gfx/tools/dmsh_xlate/Program.cs#L259) | a general lowering of subgroup ballots in vertex shaders (subgroups of one invocation: ballots, votes, lane ids and counts, refusing shuffles that exchange data between lanes) would cover any shader that counts that way |
 | `build` → `game` | 60 fps frame step (112 sites) | frame rate | kept: 1.0.1 (2019) is the last update; a function match would serve no other build of this game | checked: nso_fnmap of its 112 sites into those four mains (2026-11-09) | 1 | [ASTRAL CHAIN](../../dm/games/01007300020FA000/README.md) | the game's own clock and timers (a community 60 fps mod on the host's frame step). PlatinumGames' other games do not share them: none of its 15 functions has an exact match in Bayonetta, Bayonetta 2, Bayonetta 3 or NieR:Automata |
 | `build` → `game` | 60 fps frame step and render scale (ksys::VFR) | frame rate | kept: 44 sites in 34 functions to fingerprint for an update that may not come (1.9.0, the Switch 2 Edition release); convert when a new build appears | checked: nso_fnmap of its 44 sites into those 13 mains (2026-11-09) | 1 | [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) | the game's own frame code; the frame-step state page is general. No engine sibling shares it: none of its 34 functions has an exact match in Tears of the Kingdom, SMO, MK8D, ACNH, Splatoon 2 / 3, Kirby, Mario Party, Ocarina, Smash, Metroid Dread or Origami King (only the widescreen stubs' sead::PerspectiveProjection functions recur) |
 | `build` → `game` | Hagi coroutine stack region 1 GB → 64 MB | memory | kept: 1.1.4 is the last update; a match over Hagi would serve no other build of this game | checked: the final build 1.1.4 (the only one the profile packs), 2026-11-04 | 1 | [Super Mario 3D All-Stars: Super Mario Sunshine](../../dm/games/010049900F546002/README.md) | a size inside Hagi's own code: nothing the host sees tells a 1 GB reservation it can shrink from one it cannot |
@@ -81,7 +81,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [Taiko Risshiden V DX](#taiko-risshiden-v-dx) | 1 | 0 | 0 | 2 | 0 | `game` |
 | [The Legend of Zelda: Breath of the Wild](#the-legend-of-zelda-breath-of-the-wild) | 7 | 0 | 43 | 0 | 0 | `build` → `game` ×2 |
 | [The Legend of Zelda: Link's Awakening](#the-legend-of-zelda-links-awakening) | 1 | 0 | 0 | 0 | 0 | `build` → `game` |
-| [The Legend of Zelda: Ocarina of Time](#the-legend-of-zelda-ocarina-of-time) | 0 | 0 | 17 | 0 | 0 | `game` ×3, `build` → `game` ×3 |
+| [The Legend of Zelda: Ocarina of Time](#the-legend-of-zelda-ocarina-of-time) | 0 | 0 | 27 | 0 | 0 | `game` ×3, `build` → `game` ×3 |
 | [The Legend of Zelda: Tears of the Kingdom](#the-legend-of-zelda-tears-of-the-kingdom) | 0 | 0 | 9 | 0 | 0 | `game` |
 | [Xenoblade Chronicles 3](#xenoblade-chronicles-3) | 6 | 0 | 0 | 0 | 0 | `build` → `game` |
 
@@ -558,15 +558,22 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 - **`build` → `game`**, rendering, gap, checked: v131072 main: the sites and x16 read by disassembly; the same skip (both multiplies as no-ops) run headless in Castle Town at 3024x1702 and checked for speech bubbles and button prompts (M5 Max, macOS 26.6.2, 2026-11-09): native output: the window crop's two 80 % multiplies skipped (DM_OUTPUT=native). Two multiplies in v131072's crop function, placed by address and only when the frame-step function sits at v131072's place; a function-matched rule could carry them to other builds
 - **`build` → `game`**, rendering, gap, checked: v131072 headless at 2560x1440 and 3840x2160 (swapchain at the size, no crash, 60 fps held), in play at 2560x1440 and 3024x1702 (M5 Max, macOS 26.6.2, 2026-11-08 and 09): render size: the docked output and render size, the display mode's 2560x1440 entry and the float output size from the state page. Five fixed 2560x1440 constants in v131072's main (the sites PR #1460 found for its ultrawide cuts), placed by address and only when the frame-step function sits at v131072's place; a function-matched rule could carry them to other builds
 
-- **v131072 `main`** `e0f3ccfa…` ([patches.py:267](../../dm/games/0400486024DEC000/patches.py#L267))
-  <details><summary>13 frame-step sites</summary>
+- **v131072 `main`** `e0f3ccfa…` ([patches.py:415](../../dm/games/0400486024DEC000/patches.py#L415))
+  <details><summary>23 frame-step sites</summary>
 
+  - frame step `+0x4f1e8`: ultrawide: a 16:9 camera projection takes the state page's target aspect (DM_RENDER_SIZE wider than 16:9), written back to mAspect
+  - frame step `+0x20c2b0`: ultrawide: speech bubbles over their speaker in the squeezed layout
+  - frame step `+0x23b9a8`: ultrawide: a 16:9 camera projection takes the state page's target aspect (DM_RENDER_SIZE wider than 16:9), written back to mAspect
+  - frame step `+0x25d76c`: ultrawide: the render view's 16:9 aspect takes the target aspect
+  - frame step `+0x33b82c`: ultrawide: a 16:9 camera projection takes the state page's target aspect (DM_RENDER_SIZE wider than 16:9), written back to mAspect
   - frame step `+0x6505c4`: native output: the crop multiply skipped when state +0x44 is set (DM_OUTPUT=native), so the picture is the full output size
   - frame step `+0x6505d4`: native output: the crop multiply skipped when state +0x44 is set (DM_OUTPUT=native), so the picture is the full output size
   - frame step `+0x6e6cc4`: frame ratio: the host's step × base rate / 60 instead of base rate / the game's frame rate (state page target fps; 0 = the game's ratio)
+  - frame step `+0x774368`: ultrawide: the full-screen 2D layout squeezed into the centre 16:9 (HUD and menus undistorted)
   - frame step `+0x805bd0`: fixed resolution: the "dynamic resolution disabled" path also when state +0x60 is set
   - frame step `+0x806420`: fixed resolution: its scale from state +0x64 (0 = the game's 1.0)
   - frame step `+0x8065e0`: dynamic resolution level: 0 (full resolution) also under a render scale below 1.0, or with state +0x40 (DM_DYNAMIC_RESOLUTION) a climb on the load measured at each level
+  - frame step `+0xc2a36c`: ultrawide: the render-target pool doubled for the wider targets
   - frame step `+0xecbc80`: render size: output width as a float from the state page (DM_RENDER_SIZE)
   - frame step `+0xecbcb4`: render size: output height as a float from the state page (DM_RENDER_SIZE)
   - frame step `+0x112c604`: render size: the display mode's 2560x1440 output entry becomes the state page's size (DM_RENDER_SIZE)
@@ -574,11 +581,14 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - frame step `+0x31d3ee4`: dynamic-resolution status: a host render scale not yet stored asks for new 3D sizes (state +0x10)
   - frame step `+0x31d3f48`: final 3D view scale x the host render scale below 1.0 (1.0 = the game's own)
   - frame step `+0x31f39f4`: render size: docked render size from the state page (DM_RENDER_SIZE), 2560x1440 when it is 0
+  - frame step `+0x31f3a00`: ultrawide: the upscaler's scene size 3/4 of the picture
+  - frame step `+0x3485cc0`: ultrawide: a 16:9 camera projection takes the state page's target aspect (DM_RENDER_SIZE wider than 16:9), written back to mAspect
+  - frame step `+0x3b5c758`: ultrawide: pre-rendered movies in the centre 16:9, or filling the picture
 
   </details>
 
   - render scale stub (the launcher offers DM_RENDER_SCALE)
-  - launcher capabilities: DYNAMIC_RESOLUTION, NATIVE_OUTPUT, RENDER_SIZE
+  - launcher capabilities: DYNAMIC_RESOLUTION, NATIVE_OUTPUT, RENDER_SIZE, ULTRAWIDE
 - **function-matched frame step** (`main` of builds without FRAME_STEP): frame ratio from the host's step: a function of 0x9b4 bytes, `+0xe4` in it; dynamic resolution, a function of 0x294 bytes, `+0x0` in it; dynamic resolution update, a function of 0xb24 bytes,  in it; render scale, a function of 0xfc8 bytes, `+0xce4`, `+0xd48` in it; launcher capabilities: DYNAMIC_RESOLUTION
 
 ### The Legend of Zelda: Tears of the Kingdom
@@ -634,7 +644,7 @@ Applied to the `sdk` of any build without CUTS, found by function fingerprint ([
 
 ## Translator rules keyed by a shader's code
 
-- [Program.cs:261](../../dm/gfx/tools/dmsh_xlate/Program.cs#L261): Tears of the Kingdom 1.4.3 visibility counter (one vertex shader, exact code SHA-256 below) (**`game` → `host`**, kept: one shader in one game, already handled; a general lowering is a chain change (every game's shaders rebuilt) for no measured gain: revisit when a vertex shader with subgroup operations fails in another game: a general lowering of subgroup ballots in vertex shaders (subgroups of one invocation: ballots, votes, lane ids and counts, refusing shuffles that exchange data between lanes) would cover any shader that counts that way)
+- [Program.cs:259](../../dm/gfx/tools/dmsh_xlate/Program.cs#L259): Tears of the Kingdom 1.4.3 visibility counter (one vertex shader, exact code SHA-256 below) (**`game` → `host`**, kept: one shader in one game, already handled; a general lowering is a chain change (every game's shaders rebuilt) for no measured gain: revisit when a vertex shader with subgroup operations fails in another game: a general lowering of subgroup ballots in vertex shaders (subgroups of one invocation: ballots, votes, lane ids and counts, refusing shuffles that exchange data between lanes) would cover any shader that counts that way)
 
 ## Profile switches
 

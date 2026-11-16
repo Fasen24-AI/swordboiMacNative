@@ -35,6 +35,7 @@ def frame_step(ctx):
     render_scale(ctx)
     if base == 0x6e6be0: native_output(ctx)   # v131072's main (the only build the crop sites are known for)
     if base == 0x6e6be0: render_size(ctx)   # v131072's main (the only build the render-size sites are known for)
+    if base == 0x6e6be0: ultrawide(ctx)   # v131072's main (the only build the ultrawide sites are known for)
 
 # The game's dynamic resolution (game__gfx__DynamicResolutionParam: LoadThreshold, ReduceCounterMax, IncreaseCounterMax and a list of levels, each a ResolutionReduceScale and a
 # Priority; on v131072 levels 0..9 at 0.75..0.333 of 2048x1152, 1536x864 to 683x384). Its update (main+0x805aa0) reads the frame's GPU load (about 0.2 ms a unit) into +0x8, subtracts
@@ -148,6 +149,153 @@ def render_size(ctx):
         emit(orig); emit(B(here(), site + 4))
         fs_put(site, [B(site, start)], 'render size: output %s as a float from the state page (DM_RENDER_SIZE)' % name)
     ctx.capabilities.add('RENDER_SIZE')
+
+# Ultrawide (DM_RENDER_SIZE wider than 16:9, e.g. 3440x1440; v131072 only). Ported from craftycorvid/oot-mod (MIT, https://github.com/craftycorvid/oot-mod: build.py's
+# hooks and picture size for main E0F3CCFAF50065AE), with its constants read from the state page instead of fixed in the code, so a 16:9 size leaves the game as it is:
+#   +0x800 f32 target aspect (0 = off), +0x804 f32 HUD squeeze (16/9) / target, +0x808 f32 movie margin (1 - squeeze) / 2, +0x80c f32 speech bubble half width 1920 / squeeze,
+#   +0x810 u64 the scene size (3/4 of the picture, width | height << 32; 0 = the game's 1920x1080), +0x818 f32 the HUD edge shift (1 - squeeze; 0 keeps the HUD centred),
+#   +0x81c u32 entries in the HUD anchor table, +0x820 the table: 16 entries of {u64 screen vtable (runtime address), f32 side (-1 left edge, +1 right edge), pad},
+#   +0x9f0 f32 the movies' height growth on each side (DM_UW_MOVIE_FILL; 0 = in the centre 16:9),
+#   +0xa00 u32 1 records the screens drawn with the layout ortho, +0xa04 u32 how many, +0xa08 32 entries of {u64 screen, u64 vtable} (DM_UW_HUD_RECORD, to find a screen's vtable).
+#   Written by the loader (dm/host/loader.c) for a wide DM_RENDER_SIZE. Not +0x200: the dynamic-resolution controller's memory is +0x200..+0x290
+# The picture itself comes from render_size above (swap chain, docked render size, display mode, float output size). The hooks:
+#   - every 16:9 sead::PerspectiveProjection (doUpdateMatrix main+0x3485cc0 and its inlined copies +0x4f1e8, +0x23b9a8, +0x33b82c) takes the target aspect and writes it back
+#     to mAspect (+0xb0), so culling sees the wider view; the render view's w / h aspect for shaders (+0x25d76c) the same. Other aspects (cubemaps, 1:1) are left alone
+#   - full-screen 2D (the 3840x2160 layout ortho, +0x774368) is squeezed into the centre 16:9, except the screens that redraw a capture of the whole frame or fade it; the HUD
+#     screens of the anchor table (the hearts', the minimap's: loader.c DM_UW_HUD_DEFAULT) then move to the screen's edges (DM_UW_HUD_EDGES)
+#   - pre-rendered movies get the centre 16:9 viewport, or fill the width with their top and bottom cut (DM_UW_MOVIE_FILL; +0x3b5c758); NPC speech bubbles' layout x is
+#     divided by the squeeze (+0x20c2b0)
+#   - the graphics allocator's render-target pool is doubled (+0xc2a36c, as Lichii PR #976's "Texture Pool x2"): the wider targets ran the stock pool out and the game froze
+#   - the scene its upscaler takes in (+0x31f3a00, 1920x1080) is 3/4 of the picture
+# Scratch registers are those craftycorvid's hooks use (overwritten by the game right after each site), plus x16 / x17 saved around the pool hook
+_uw = 0x800
+_uw_full_frame_screens = (0x4bed098, 0x4be4fb0, 0x4be7b30, 0x4be61c8)   # vtables: L/R item menu, pause / system menu backgrounds, area loading fade, cutscene fades
+def _uw_f32(x): import struct; return struct.unpack('<I', struct.pack('<f', x))[0]
+def _uw_movz(wd, imm): return 0x52800000 | (imm & 0xffff) << 5 | wd
+def _uw_movk16(wd, imm): return 0x72a00000 | (imm & 0xffff) << 5 | wd
+def _uw_fmov_sw(sd, wn): return 0x1e270000 | wn << 5 | sd
+def _uw_fmov_ws(wd, sn): return 0x1e260000 | sn << 5 | wd
+def _uw_fmov_ss(sd, sn): return 0x1e204000 | sn << 5 | sd
+def _uw_fsub(sd, sn, sm): return 0x1e203800 | sm << 16 | sn << 5 | sd
+def _uw_fadd(sd, sn, sm): return 0x1e202800 | sm << 16 | sn << 5 | sd
+def _uw_fmul(sd, sn, sm): return 0x1e200800 | sm << 16 | sn << 5 | sd
+def _uw_fabs(sd, sn): return 0x1e20c000 | sn << 5 | sd
+def _uw_fcmp(sn, sm): return 0x1e202000 | sm << 16 | sn << 5
+def _uw_fcmp0(sn): return 0x1e202008 | sn << 5
+def _uw_ldr_s(st, xn, off): return 0xbd400000 | (off // 4) << 10 | xn << 5 | st
+def _uw_str_s(st, xn, off): return 0xbd000000 | (off // 4) << 10 | xn << 5 | st
+def _uw_ldr_w(wt, xn, off): return 0xb9400000 | (off // 4) << 10 | xn << 5 | wt
+def _uw_ldr_x(xt, xn, off): return 0xf9400000 | (off // 8) << 10 | xn << 5 | xt
+def _uw_ldp_s(s1, s2, xn, off): return 0x2d400000 | ((off // 4) & 0x7f) << 15 | s2 << 10 | xn << 5 | s1
+def _uw_ldp_q(q1, q2, xn, off): return 0xad400000 | ((off // 16) & 0x7f) << 15 | q2 << 10 | xn << 5 | q1
+def _uw_ldp_x(x1, x2, xn, off): return 0xa9400000 | ((off // 8) & 0x7f) << 15 | x2 << 10 | xn << 5 | x1
+def _uw_cmp_w(wn, wm): return 0x6b00001f | wm << 16 | wn << 5
+def _uw_cmp_x(xn, xm): return 0xeb00001f | xm << 16 | xn << 5
+def _uw_sub_x(xd, xn, imm): return 0xd1000000 | imm << 10 | xn << 5 | xd
+def _uw_add_x(xd, xn, imm): return 0x91000000 | imm << 10 | xn << 5 | xd
+def _uw_umov_s1(wd, vn): return 0x0e0c3c00 | vn << 5 | wd   # mov wd, vn.s[1]
+def _uw_and_abs(wd, wn): return 0x12007800 | wn << 5 | wd   # and wd, wn, #0x7fffffff
+def _uw_dup_4s(vd, wn): return 0x4e040c00 | wn << 5 | vd
+def _uw_fmul_4s(vd, vn, vm): return 0x6e20dc00 | vm << 16 | vn << 5 | vd
+def _uw_scvtf_sw(sd, wn): return 0x1e220000 | wn << 5 | sd
+def _uw_fdiv(sd, sn, sm): return 0x1e201800 | sm << 16 | sn << 5 | sd
+def _uw_cmp_w_imm(wn, imm): return 0x7100001f | imm << 10 | wn << 5
+def _uw_mov_w(wd, wm): return 0x2a0003e0 | wm << 16 | wd
+def _uw_ldr_x_post(xt, xn, imm): return 0xf8400400 | (imm & 0x1ff) << 12 | xn << 5 | xt
+def _uw_subs_w(wd, wn, imm): return 0x71000000 | imm << 10 | wn << 5 | wd
+def _uw_add_w(wd, wn, imm): return 0x11000000 | imm << 10 | wn << 5 | wd
+def _uw_stp_x(x1, x2, xn, off): return 0xa9000000 | ((off // 8) & 0x7f) << 15 | x2 << 10 | xn << 5 | x1
+def _uw_str_w(wt, xn, off): return 0xb9000000 | (off // 4) << 10 | xn << 5 | wt
+def _uw_ldur_s(st, xn, imm): return 0xbc400000 | (imm & 0x1ff) << 12 | xn << 5 | st
+def _uw_dup_s0(sd, vn): return 0x5e040400 | vn << 5 | sd   # mov sd, vn.s[0]
+def _uw_ins_s0(vd, vn): return 0x6e040400 | vn << 5 | vd   # mov vd.s[0], vn.s[0]
+# Branches inside a stub body are written as ('b.cond' | 'cbz' | 'cbnz', cond or register, label) and labels as ('label', name); 'end' is the branch back.
+# An ADRP is ('adrp', register, target). _uw_stub resolves them against the body's place and emits it, then the branch back
+def _uw_stub(ctx, site, original, body, why):
+    import struct
+    ctx.site(site, b''.join(struct.pack('<I', w) for w in original).hex())
+    start = ctx.here(); labels, pos = {}, 0
+    for w in body:
+        if isinstance(w, tuple) and w[0] == 'label': labels[w[1]] = pos
+        else: pos += 1
+    labels['end'] = pos
+    words = []
+    for w in body:
+        if isinstance(w, tuple):
+            if w[0] == 'label': continue
+            pc = start + 4 * len(words)
+            if w[0] == 'adrp': words.append(ADRP(w[1], pc, w[2])); continue
+            off = ((start + 4 * labels[w[2]]) - pc) >> 2
+            if w[0] == 'b.cond': words.append(0x54000000 | (off & 0x7ffff) << 5 | w[1])
+            elif w[0] == 'cbz': words.append(0x34000000 | (off & 0x7ffff) << 5 | w[1])
+            elif w[0] == 'cbnz': words.append(0x35000000 | (off & 0x7ffff) << 5 | w[1])
+            elif w[0] == 'cbnz_x': words.append(0xb5000000 | (off & 0x7ffff) << 5 | w[1])
+            elif w[0] == 'b': words.append(0x14000000 | (off & 0x3ffffff))
+            else: raise ValueError(w)
+        else: words.append(w)
+    for w in words: ctx.emit(w)
+    ctx.emit(B(ctx.here(), site + 4 * len(original)))
+    ctx.put(site, [B(site, start)] + [NOP] * (len(original) - 1), why)
+_c_eq, _c_ne, _c_hs, _c_pl = 0, 1, 2, 5
+def _uw_load_f32(wt, st, value):
+    bits = _uw_f32(value)
+    return [_uw_movz(wt, bits), _uw_movk16(wt, bits >> 16), _uw_fmov_sw(st, wt)]
+# if |sa - 16/9| < 0.01 and the state's target is set: sa = target (and store it to [writeback, #0xb0]); b.pl leaves NaN alone
+def _uw_fix_aspect(ST, sa, wt, sp, sq, writeback=None):
+    return (_uw_load_f32(wt, sp, 16 / 9) + [_uw_fsub(sp, sa, sp), _uw_fabs(sp, sp)] + _uw_load_f32(wt, sq, 0.01)
+            + [_uw_fcmp(sp, sq), ('b.cond', _c_pl, 'end'), ('adrp', wt, ST), _uw_ldr_s(sp, wt, (ST & 0xfff) + _uw), _uw_fcmp0(sp), ('b.cond', _c_eq, 'end'),
+               _uw_fmov_ss(sa, sp)] + ([_uw_str_s(sa, writeback, 0xb0)] if writeback is not None else []))
+def ultrawide(ctx):
+    ST = ctx.state
+    assert ST % 0x1000 == 0   # the loads below take the state page's offset in their immediate
+    # the four projection builders: ldp s0, sN, [xB, #0xac] (fovy, aspect)
+    for site, orig, base, sa, wt, sp, sq in ((0x3485cc0, 0x2d558400, 0, 1, 16, 16, 17), (0x004f1e8, 0x2d558ea0, 21, 3, 9, 4, 5),
+                                             (0x023b9a8, 0x2d558c00, 0, 3, 9, 4, 5), (0x033b82c, 0x2d558440, 2, 1, 9, 2, 3)):
+        _uw_stub(ctx, site, [orig], [_uw_ldp_s(0, sa, base, 0xac)] + _uw_fix_aspect(ST, sa, wt, sp, sq, writeback=base),
+                 'ultrawide: a 16:9 camera projection takes the state page\'s target aspect (DM_RENDER_SIZE wider than 16:9), written back to mAspect')
+    # the render view's aspect for shaders: scvtf s1, w21; fdiv s1, s1, s2
+    _uw_stub(ctx, 0x025d76c, [0x1e2202a1, 0x1e221821], [_uw_scvtf_sw(1, 21), _uw_fdiv(1, 1, 2)] + _uw_fix_aspect(ST, 1, 16, 16, 17),
+             'ultrawide: the render view\'s 16:9 aspect takes the target aspect')
+    # full-screen 2D: after ldp q1, q4, [x2] (the projection's first two vectors, its x and y columns; x0 = canvas), the 3840x2160 layout ortho's x column scaled by the squeeze,
+    # unless the canvas's screen covers the frame. The projection is set when a screen is made, not every frame
+    # x10..x17 and v16..v18 are free here: the function is a leaf that uses none of them after the site (v16..v19 are written next), and its callers take x9..x17 as clobbered.
+    # Then each screen in the anchor table (state +0x820, by vtable) moves to its side: the x translation (element 0 of the fourth vector, q6, loaded before the site: the
+    # vectors are the matrix's columns, so q1's element 3 is w's x term) += side * edge shift, so the centre 16:9 area's edge meets the
+    # screen's (the hearts on the left, the minimap on the right); other screens stay centred. DM_UW_HUD_RECORD lists the screens drawn so (state +0xa00)
+    body = [_uw_ldp_q(1, 4, 2, 0), _uw_fmov_ws(16, 1), _uw_movz(17, _uw_f32(2 / 3840)), _uw_movk16(17, _uw_f32(2 / 3840) >> 16), _uw_cmp_w(16, 17), ('b.cond', _c_ne, 'end'),
+            _uw_umov_s1(16, 4), _uw_and_abs(16, 16), _uw_movz(17, _uw_f32(2 / 2160)), _uw_movk16(17, _uw_f32(2 / 2160) >> 16), _uw_cmp_w(16, 17), ('b.cond', _c_ne, 'end'),
+            _uw_sub_x(15, 0, 0x1b8), _uw_ldr_x(16, 15, 0)]   # the UI screen object holding the canvas at +0x1b8 (x15): its vtable (x16)
+    for vt in _uw_full_frame_screens: body += [('adrp', 17, vt), _uw_add_x(17, 17, vt & 0xfff), _uw_cmp_x(16, 17), ('b.cond', _c_eq, 'end')]
+    o = (ST & 0xfff) + _uw
+    body += [('adrp', 14, ST),
+             _uw_ldr_w(12, 14, o + 0x200), ('cbz', 12, 'squeeze'), _uw_ldr_w(12, 14, o + 0x204), _uw_cmp_w_imm(12, 32), ('b.cond', _c_hs, 'squeeze'),
+             _uw_add_x(11, 14, o + 0x208), _uw_mov_w(13, 12),
+             ('label', 'scan'), ('cbz', 13, 'new'), _uw_ldr_x_post(10, 11, 16), _uw_cmp_x(10, 15), ('b.cond', _c_eq, 'squeeze'), _uw_subs_w(13, 13, 1), ('b', 0, 'scan'),
+             ('label', 'new'), _uw_stp_x(15, 16, 11, 0), _uw_add_w(12, 12, 1), _uw_str_w(12, 14, o + 0x204),
+             ('label', 'squeeze'), _uw_ldr_w(13, 14, o + 4), ('cbz', 13, 'end'), _uw_dup_4s(17, 13), _uw_fmul_4s(1, 1, 17),
+             _uw_ldr_w(12, 14, o + 0x1c), ('cbz', 12, 'end'), _uw_add_x(11, 14, o + 0x20),
+             ('label', 'find'), _uw_ldr_x_post(10, 11, 16), _uw_cmp_x(10, 16), ('b.cond', _c_eq, 'found'), _uw_subs_w(12, 12, 1), ('b.cond', _c_ne, 'find'), ('b', 0, 'end'),
+             ('label', 'found'), _uw_ldur_s(16, 11, -8), _uw_ldr_s(18, 14, o + 0x18), _uw_fmul(16, 16, 18), _uw_dup_s0(18, 6), _uw_fadd(18, 18, 16), _uw_ins_s0(6, 18)]
+    _uw_stub(ctx, 0x0774368, [0xad401041], body, 'ultrawide: the full-screen 2D layout squeezed into the centre 16:9 (HUD and menus undistorted)')
+    # movie layer draw, after its full-target viewport (sead::Viewport at x29-40: minX +8, minY +12, maxX +16, maxY +20): shrunk to the centre 16:9 by the margin (state
+    # +0x808, 0 leaves it), or, filling the wide picture (DM_UW_MOVIE_FILL), its height grown by state +0x9f0 of it on each side ((target / (16/9) - 1) / 2: the movie keeps its
+    # shape, its top and bottom cut by the target's edges; 0 leaves it), then ldp x9, x8, [x19, #24]
+    body = [_uw_sub_x(16, 29, 40), _uw_ldr_s(16, 16, 8), _uw_ldr_s(17, 16, 16), _uw_fsub(18, 17, 16), ('adrp', 17, ST), _uw_ldr_s(19, 17, (ST & 0xfff) + _uw + 8),
+            _uw_fmul(18, 18, 19), _uw_fadd(16, 16, 18), _uw_fsub(17, 17, 18), _uw_str_s(16, 16, 8), _uw_str_s(17, 16, 16),
+            _uw_ldr_s(16, 16, 12), _uw_ldr_s(17, 16, 20), _uw_fsub(18, 17, 16), _uw_ldr_s(19, 17, (ST & 0xfff) + _uw + 0x1f0),
+            _uw_fmul(18, 18, 19), _uw_fsub(16, 16, 18), _uw_fadd(17, 17, 18), _uw_str_s(16, 16, 12), _uw_str_s(17, 16, 20), _uw_ldp_x(9, 8, 19, 24)]
+    _uw_stub(ctx, 0x3b5c758, [0xa941a269], body, 'ultrawide: pre-rendered movies in the centre 16:9, or filling the picture')
+    # NPC speech bubble anchor: mov w8, #1920.0 (layout x = ndc x * 1920) becomes 1920 / squeeze when set
+    body = [('adrp', 8, ST), _uw_ldr_w(8, 8, (ST & 0xfff) + _uw + 0xc), ('cbnz', 8, 'end'), 0x52a89e08]
+    _uw_stub(ctx, 0x020c2b0, [0x52a89e08], body, 'ultrawide: speech bubbles over their speaker in the squeezed layout')
+    # graphics allocator setup: stp x8, x9, [sp, #16] stores the render-target pool's initial size; doubled when the target aspect is set
+    body = [0xa9bf47f0, ('adrp', 16, ST), _uw_ldr_w(17, 16, (ST & 0xfff) + _uw), ('cbz', 17, 'keep'), 0xd37ff908,   # stp x16,x17,[sp,#-16]!; ...; lsl x8,x8,#1
+            ('label', 'keep'), 0xa8c147f0, 0xa90127e8]   # ldp x16,x17,[sp],#16; stp x8,x9,[sp,#16]
+    _uw_stub(ctx, 0x0c2a36c, [0xa90127e8], body, 'ultrawide: the render-target pool doubled for the wider targets')
+    # the scene the upscaler takes in: mov x8, #1920; movk x8, #1080, lsl #32, or the state page's size
+    body = [('adrp', 8, ST), _uw_ldr_x(8, 8, (ST & 0xfff) + _uw + 0x10), ('cbnz_x', 8, 'end'), 0xd280f008, 0xf2c08708]
+    _uw_stub(ctx, 0x31f3a00, [0xd280f008, 0xf2c08708], body, 'ultrawide: the upscaler\'s scene size 3/4 of the picture')
+    ctx.capabilities.add('ULTRAWIDE')
 
 # Render scale (DM_RENDER_SCALE, state +0x10, dm/host/loader.c): the 3D views at that fraction of the game's own size, the dynamic resolution held at its top level (as Tears of the
 # Kingdom's and Breath of the Wild's). The views' sizes come from the scale the engine stores at +0xd48 of its view-size update (str s0,[x20,#0xe5c]; v131072 main+0x31d3200, found by

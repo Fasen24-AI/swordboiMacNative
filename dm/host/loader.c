@@ -245,6 +245,11 @@ static void force_check(void) {
     LOG("force: %u entries hit, %u not referenced by this game", g_nforce - unused, unused);
 }
 
+// Ocarina of Time v131072's HUD screens moved to an edge on a wide picture (patches.py ultrawide, the anchor table; DM_UW_HUD replaces it): <main offset of the screen's vtable>:<side>. Found by
+// recording the screens drawn with the layout ortho (DM_UW_HUD_RECORD=1) and giving each a different shift (DM_UW_HUD): the hearts' screen to the left edge, the minimap's to the
+// right one; the action prompt (main+0x4be5a50) and the rest stay in the centre 16:9
+#define DM_UW_HUD_DEFAULT "4beb710:-1,4be8300:1"
+static int g_ultrawide_build;   // main's fixups table has ULTRAWIDE (Ocarina of Time v131072, patches.py ultrawide): DM_RENDER_SIZE may be wider than 16:9 (install_fps_state)
 // Read the rewriter table header (segment boundaries, slot numbers); any row beyond the header means an old-format build output (code modified at load time), which is rejected
 static void read_layout(module_t *m, const char *dir) {
     char path[1024]; snprintf(path, sizeof path, "%s/%s.fixups.tsv", dir, m->name);
@@ -265,6 +270,7 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "RO_OFF")) m->ro_off = v;
         else if (!strcmp(key, "DATA_OFF")) m->data_off = v;
         else if (!strcmp(key, "FPS_STATE_OFF")) m->fps_state_off = v;
+        else if (!strcmp(key, "ULTRAWIDE") && !strcmp(m->name, "main")) g_ultrawide_build = v == 1;   // patches.py ultrawide: DM_RENDER_SIZE may be wider than 16:9
         else if (!strcmp(key, "UE_MALLOC_VT")) m->ue_malloc_vt = v;
         else if (!strcmp(key, "UE_MALLOC_SLOT")) m->ue_malloc_slot = (unsigned)v;
         else if (!strcmp(key, "FPS_TARGET_PTR")) m->fps_target_ptr = v;
@@ -303,11 +309,11 @@ static void read_layout(module_t *m, const char *dir) {
 // Frame step state (the page after the key page, read-write; layout in patch_nso.py FRAME_STEP): the rewriter's stubs step the game by the host's whole vsyncs capped at this
 // target, 0 = the game's own interval logic. The profile's fps_target, overridden by DM_FPS_TARGET (0, 30 or 60); the graphics layer decides the steps and paces presents
 // (hle_nvn.c fstep_tick)
-uint8_t *dm_fps_state;
+uint8_t *dm_fps_state; static uint8_t *g_fps_base;   // main's base, for the ultrawide HUD anchor table's runtime vtable addresses
 static const char *g_fps_mod;   // the module holding the state page (for the log)
 static void install_fps_state(module_t *m) {
     if (m->fps_state_off + 0x40 > m->size || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
-    dm_fps_state = m->base + m->fps_state_off; g_fps_mod = m->name;
+    dm_fps_state = m->base + m->fps_state_off; g_fps_base = m->base; g_fps_mod = m->name;
 }
 // The settings in the state page, written when the game starts (main.c, after host loading): on iOS the loading runs at app launch, before the launcher has set DM_FPS_TARGET and
 // DM_RENDER_SCALE (Launcher.swift), and nothing reads the page before the game runs
@@ -345,13 +351,49 @@ void dm_fps_state_apply(void) {
     // Render size, for builds whose stub reads it (the RENDER_SIZE capability: Hades II 1.0.131248's app init): DM_RENDER_SIZE=<w>x<h>, 16:9 from 1280x720 to 3840x2160, sets the
     // game's own swapchain and screen-sized targets; unset or 0 keeps the game's size. Builds without such a stub ignore the field
     const char *rz = getenv("DM_RENDER_SIZE"); uint32_t wh[2] = {0, 0};
+    // Wider than 16:9 (a build with the ULTRAWIDE capability: Ocarina of Time v131072, patches.py ultrawide): the picture takes that shape, the 16:9 cameras the target aspect,
+    // the full-screen 2D the centre 16:9 with the HUD screens of DM_UW_HUD_DEFAULT at the screen's edges (DM_UW_HUD_EDGES), the movies the whole width (DM_UW_MOVIE_FILL) or
+    // the centre 16:9. State +0x800 f32 target aspect, +0x804 squeeze (16/9) / target, +0x808 movie margin, +0x80c speech bubble half width,
+    // +0x810 u64 the upscaler's scene (3/4 of the picture), +0x818 the HUD edge shift (1 - squeeze), +0x81c / +0x820 the HUD anchor table (the screens moved to an edge),
+    // +0x9f0 the movies' height growth on each side, +0xa00 the screen recorder (DM_UW_HUD_RECORD=1). All 0 for a 16:9 size, which the stubs read as the game's own. Not +0x200: the dynamic-resolution controller's memory
+    float uw[4] = {0, 0, 0, 0}; uint64_t uw_scene = 0; float uw_edge = 0, uw_movie = 0;
     if (rz && strcmp(rz, "0")) {
         unsigned w = 0, h = 0; char tail = 0;
-        if (sscanf(rz, "%ux%u%c", &w, &h, &tail) != 2 || w * 9 != h * 16 || w < 1280 || w > 3840)
-            LOG("[RED] DM_RENDER_SIZE=%s: must be <width>x<height>, 16:9, from 1280x720 to 3840x2160; keeping the game's size", rz);
-        else { wh[0] = w; wh[1] = h; LOG("%s: render size %ux%u (DM_RENDER_SIZE)", g_fps_mod, w, h); }
+        int ok = sscanf(rz, "%ux%u%c", &w, &h, &tail) == 2;
+        int wide = ok && g_ultrawide_build && (uint64_t)w * 9 > (uint64_t)h * 16 && w <= 5120 && h >= 720 && h <= 2160 && !(w % 4) && !(h % 4);
+        if (!wide && (!ok || w * 9 != h * 16 || w < 1280 || w > 3840))
+            LOG("[RED] DM_RENDER_SIZE=%s: must be <width>x<height>, 16:9, from 1280x720 to 3840x2160%s; keeping the game's size", rz,
+                g_ultrawide_build ? ", or wider (multiples of 4, up to 5120 wide, 720 to 2160 high)" : "");
+        else {
+            wh[0] = w; wh[1] = h;
+            if (wide) {
+                float a = (float)w / (float)h, sq = (16.0f / 9.0f) / a;
+                uw[0] = a; uw[1] = sq; uw[2] = (1.0f - sq) / 2.0f; uw[3] = 1920.0f / sq;
+                const char *mf = getenv("DM_UW_MOVIE_FILL"); if (!mf || strcmp(mf, "0")) { uw[2] = 0; uw_movie = (1.0f / sq - 1.0f) / 2.0f; }   // movies fill the width, top and bottom cut
+                uw_scene = (uint64_t)(w * 3 / 4) | (uint64_t)(h * 3 / 4) << 32;
+                const char *he = getenv("DM_UW_HUD_EDGES"); if (!he || strcmp(he, "0")) uw_edge = 1.0f - sq;   // the HUD at the screen's edges (0: in the centre 16:9)
+                extern void mtl_present_screen(uint32_t w, uint32_t h); mtl_present_screen(w, h);   // the picture keeps its own shape on screen (nvn_mtl.m present_shape)
+                LOG("%s: render size %ux%u (DM_RENDER_SIZE), ultrawide %.3f:1: cameras widened, HUD %s, movies %s, scene %ux%u", g_fps_mod, w, h, a,
+                    uw_edge != 0 ? "at the screen's edges" : "in the centre 16:9", uw_movie != 0 ? "filling the width" : "in the centre 16:9", w * 3 / 4, h * 3 / 4);
+            } else LOG("%s: render size %ux%u (DM_RENDER_SIZE)", g_fps_mod, w, h);
+        }
     }
     memcpy(dm_fps_state + 0x38, wh, sizeof wh);
+    memcpy(dm_fps_state + 0x800, uw, sizeof uw); memcpy(dm_fps_state + 0x810, &uw_scene, sizeof uw_scene); memcpy(dm_fps_state + 0x818, &uw_edge, sizeof uw_edge); memcpy(dm_fps_state + 0x9f0, &uw_movie, sizeof uw_movie);
+    // The HUD anchor table: DM_UW_HUD (or DM_UW_HUD_DEFAULT above) as <main offset of a screen vtable>:<side -1 / 1>,...; 16 entries of {u64 runtime vtable, f32 side}
+    if (uw_edge != 0) {
+        const char *ht = getenv("DM_UW_HUD"); uint32_t n = 0;
+        for (const char *q = ht ? ht : DM_UW_HUD_DEFAULT; q && *q && n < 16; ) {
+            char *e; uint64_t off = strtoull(q, &e, 16); if (e == q || *e != ':') break;
+            float side = strtof(e + 1, &e); uint64_t vt = (uint64_t)(uintptr_t)g_fps_base + off;
+            memcpy(dm_fps_state + 0x820 + 16 * n, &vt, 8); memcpy(dm_fps_state + 0x828 + 16 * n, &side, 4); n++;
+            q = *e == ',' ? e + 1 : e;
+        }
+        memcpy(dm_fps_state + 0x81c, &n, 4);
+        LOG("%s: ultrawide HUD: %u screens anchored to the screen's edges (shift %.3f)%s", g_fps_mod, n, uw_edge, ht ? " (DM_UW_HUD)" : "");
+    }
+    { const char *hr = getenv("DM_UW_HUD_RECORD"); uint32_t rec = hr && !strcmp(hr, "1"); memcpy(dm_fps_state + 0xa00, &rec, 4);
+      if (rec) LOG("%s: ultrawide HUD: recording the screens drawn with the layout ortho at state %p + 0xa00 (main base %p)", g_fps_mod, (void *)dm_fps_state, (void *)g_fps_base); }
     // Screen shape: DM_SCREEN_ASPECT, the screen's width / height between 1.3 and 1.77, makes the builds with screen-shape stubs
     // (Breath of the Wild 1.9.0's patches.py) render that shape: the output keeps its width (1920) and takes the height that gives the ratio, a multiple of 48 so the
     // 2/3-size layout space (1280 wide) stays whole: 1.43 → 1920x1344 and 1280x896. State +0x48 u32 output height, +0x4c u32 layout height, +0x50 its float; 0 = 16:9
